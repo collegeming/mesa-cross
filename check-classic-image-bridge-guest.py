@@ -47,6 +47,14 @@ for text in ['#include "vk_android_native_buffer_gfxstream.h"',
              'height > UINT32_MAX / row',
              'cib1Views(pCreateInfo->format, pCreateInfo->flags, cib1ViewsInfo)',
              'VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT',
+             'if (!list) return true;',
+             'VkFormat cib1ViewFormats[2] = {};',
+             'else if (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)',
+             'cib1ViewFormats[0] = pCreateInfo->format;',
+             'cib1ViewFormats[1] = srgb;',
+             'cib1ViewList.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;',
+             'cib1ViewList.viewFormatCount = 2;',
+             'cib1ViewList.pViewFormats = cib1ViewFormats;',
              'list->viewFormatCount > 2',
              'gpu->createResource(width, height, stride, bytes, vf,',
              'cib1Resource->wait()',
@@ -70,6 +78,12 @@ for text in ['#include "vk_android_native_buffer_gfxstream.h"',
              'maxMipLevels = 1', 'maxArrayLayers = 1', 'sampleCounts = VK_SAMPLE_COUNT_1_BIT',
              'if (!cib1Query) localImageFormatInfo.usage &=']:
     assert text in rt, text
+create_block = rt[rt.index('if (cib1) {'):rt.index('if (extImgCiPtr && !cib1)')]
+assert 'if (cib1ViewsInfo) {' in create_block
+assert 'else if (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)' in create_block
+assert 'cib1ViewFormats[0] = pCreateInfo->format;\n            cib1ViewFormats[1] = srgb;' in create_block
+assert create_block.index('if (cib1ViewsInfo)') < create_block.index(
+    'else if (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)')
 assert 'VirtGpuResourcePtr classicBridgeResource = nullptr' in rh
 assert 'VkImage classicBridgeImage = VK_NULL_HANDLE' in rh
 assert rt.index('cib1Resource = gpu->createResource') < rt.index('VkMemoryRequirements memReqs;', rt.index('cib1Resource = gpu->createResource'))
@@ -78,5 +92,5 @@ query_start = rt.index('    if (cib1Query) {', result_start)
 query = rt[query_start:rt.index('#ifdef LINUX_GUEST_BUILD', query_start)]
 assert 'IMPORTABLE_BIT' not in query
 assert result_start < query_start
-print('PASS CIB1 120/124/128 cap append; zero-tail GET_CAPS-success witness; exact marker; classic GEM before native image; authoritative nonzero CB size/DEVICE_LOCAL-only req; dedicated allocation/single bind; map/import rejection; guest PRIME export; EXPORTABLE|DEDICATED_ONLY query exact request type')
+print('PASS CIB1 120/124/128 cap append; zero-tail GET_CAPS-success witness; exact marker; classic GEM before native image; authoritative nonzero CB size/DEVICE_LOCAL-only req; dedicated allocation/single bind; map/import rejection; guest PRIME export; EXPORTABLE|DEDICATED_ONLY query exact request type; no-list MUTABLE accepts and synthesizes exactly {base, srgb} on the wire')
 print('LIMIT source checks and compilation do not establish native AHB or desktop runtime correctness; paired host required; bridge FD import intentionally unsupported')

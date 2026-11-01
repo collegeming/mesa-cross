@@ -49,7 +49,8 @@ int main() {
     formats[0]=VK_FORMAT_B8G8R8A8_UNORM; assert(cib1Views(VK_FORMAT_B8G8R8A8_UNORM,VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,&list));
     list.viewFormatCount=3; assert(!cib1Views(VK_FORMAT_B8G8R8A8_UNORM,VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,&list));
     list.viewFormatCount=0; assert(!cib1Views(VK_FORMAT_B8G8R8A8_UNORM,VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,&list));
-    assert(!cib1Views(VK_FORMAT_B8G8R8A8_UNORM,VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,nullptr));
+    assert(cib1Views(VK_FORMAT_B8G8R8A8_UNORM,VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,nullptr));
+    assert(cib1Views(VK_FORMAT_R8G8B8A8_UNORM,VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,nullptr));
     assert(cib1Views(VK_FORMAT_B8G8R8A8_UNORM,0,nullptr));
     uint32_t stride=0,size=0;
     assert(cib1Layout(1280,720,&stride,&size)&&stride==5120&&size==3686400);
@@ -67,7 +68,7 @@ int main() {
     assert(!cib1Handles(0)); assert(cib1Handles(VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT));
     assert(cib1Handles(VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT));
     assert(!cib1Handles(VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID));
-    puts("PASS extracted production CIB1 helpers:129 short/full cap copies, failure/version/default-off; geometry/mutable view families; overflow/layout;32 bind identity states;8 allocation retention/rollback decisions; no Vulkan linkage or GPU execution");
+    puts("PASS extracted production CIB1 helpers:129 short/full cap copies, failure/version/default-off; geometry/mutable view families incl no-list MUTABLE; overflow/layout;32 bind identity states;8 allocation retention/rollback decisions; no Vulkan linkage or GPU execution");
 }
 '''
 out.mkdir(parents=True, exist_ok=True)

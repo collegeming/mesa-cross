@@ -1,11 +1,11 @@
 name: niri classic image bridge guest (artifact only)
 on:
   push:
-    branches: [diagnostic/niri-classic-image-bridge-guest]
+    branches: [diagnostic/niri-cib-noviewlist-guest]
 permissions:
   contents: read
 concurrency:
-  group: niri-classic-image-bridge-guest-${{ github.ref }}
+  group: niri-cib-noviewlist-guest-${{ github.ref }}
   cancel-in-progress: false
 env:
   MESA_COMMIT: cecc0e96d7193c72356a31abb0cc589e4fc0415e
@@ -14,7 +14,7 @@ env:
   MESA_SRC_DIR: ${{ github.workspace }}/mesa
 jobs:
   build:
-    if: github.repository == 'collegeming/mesa-cross' && github.ref == 'refs/heads/diagnostic/niri-classic-image-bridge-guest'
+    if: github.repository == 'collegeming/mesa-cross' && github.ref == 'refs/heads/diagnostic/niri-cib-noviewlist-guest'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -84,7 +84,7 @@ jobs:
             printf 'MESA_COMMIT=%s\nMESA_TREE=%s\nVULKAN_HEADERS=1.4.358\n' "$MESA_COMMIT" "$MESA_TREE"
             printf 'BASE_REFERENCE_RECIPE=ebfef3af696fb1a61c3eb3ec75bd567aad3016cd\nCIB_VERSION=1\nCIB_CONTRACT=43494231\nCIB_EXPORT_ONLY=true\n'
             printf 'GATE=zero128+GET_CAPSsuccess+exactnonzerotail; kernel copies min(requested,host-advertised-max-size); no userspace GET_CAPSET_INFO ioctl\n'
-            printf 'BOUNDARY=RGBA/BGRA_UNORM 2D one mip/layer/sample; non-CPU-mappable DEVICE_LOCAL shadow; classic GEM staging extent separate from actual native AHB allocation; dedicated offset0 ordinary native bind once; guest PRIME FD export only; no bridge FD imports\n'
+            printf 'BOUNDARY=RGBA/BGRA_UNORM 2D one mip/layer/sample; non-CPU-mappable DEVICE_LOCAL shadow; classic GEM staging extent separate from actual native AHB allocation; dedicated offset0 ordinary native bind once; guest PRIME FD export only; no bridge FD imports; no-list MUTABLE creates synthesize exactly {base,srgb} in the wire pNext only\n'
             printf 'EXECUTION=Actions compile/source checks only; no guest GPU execution; first runtime acceptance actual niri desktop on paired host\n'
             docker image inspect droidvm-mesa-cross:latest --format 'DOCKER_IMAGE_ID={{.Id}}'
             sha256sum patch-guest-modifier.py patch-classic-image-bridge-guest.py check-classic-image-bridge-guest.py test-classic-image-bridge-guest.py

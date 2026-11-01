@@ -75,7 +75,7 @@ static bool cib1Geometry(VkImageType type, VkFormat format, VkImageCreateFlags f
 }
 static bool cib1Views(VkFormat base, VkImageCreateFlags flags,
                      const VkImageFormatListCreateInfo* list) {
-    if (!list) return !(flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+    if (!list) return true;
     if (!list->viewFormatCount || list->viewFormatCount > 2 || !list->pViewFormats)
         return false;
     const VkFormat srgb = base == VK_FORMAT_R8G8B8A8_UNORM
@@ -123,6 +123,7 @@ edit(rt, '''    vk_struct_chain_iterator structChainIter = vk_make_chain_iterato
     uint32_t cib1ResourceId = 0;
     VkNativeBufferANDROID cib1Native{};
     VkImageFormatListCreateInfo cib1ViewList{};
+    VkFormat cib1ViewFormats[2] = {};
 #endif''')
 edit(rt, '''    if (extImgCiPtr) {
         localExtImgCi = vk_make_orphan_copy(*extImgCiPtr);
@@ -168,6 +169,18 @@ edit(rt, '''    if (extImgCiPtr) {
         vk_append_struct(&structChainIter, &cib1Native);
         if (cib1ViewsInfo) {
             cib1ViewList = vk_make_orphan_copy(*cib1ViewsInfo);
+            vk_append_struct(&structChainIter, &cib1ViewList);
+        } else if (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+            // No list was supplied. Synthesize only the wire list; the application's
+            // original create info is unchanged. The host and driver still validate.
+            const VkFormat srgb = pCreateInfo->format == VK_FORMAT_R8G8B8A8_UNORM
+                ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_B8G8R8A8_SRGB;
+            cib1ViewFormats[0] = pCreateInfo->format;
+            cib1ViewFormats[1] = srgb;
+            cib1ViewList.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+            cib1ViewList.pNext = nullptr;
+            cib1ViewList.viewFormatCount = 2;
+            cib1ViewList.pViewFormats = cib1ViewFormats;
             vk_append_struct(&structChainIter, &cib1ViewList);
         }
     }
