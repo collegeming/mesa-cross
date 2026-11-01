@@ -47,6 +47,19 @@ jobs:
           grep -Eq '^#define VK_HEADER_VERSION_COMPLETE VK_MAKE_API_VERSION\(0, 1, 4, VK_HEADER_VERSION\)$' "$MESA_SRC_DIR/include/vulkan/vulkan_core.h"
           git -C "$MESA_SRC_DIR" diff --exit-code HEAD --
 
+      - name: Apply pinned modifier fix and assert regression boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          src="$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp"
+          git -C "$MESA_SRC_DIR" show "HEAD:src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp" > "$RUNNER_TEMP/ResourceTracker.base.cpp"
+          python3 -I ./patch-guest-modifier.py "$src" --diff out/guest-modifier.patch | tee out/patch-checks.txt
+          cp patch-guest-modifier.py out/
+          git -C "$MESA_SRC_DIR" diff --check
+          test "$(git -C "$MESA_SRC_DIR" diff --name-only HEAD --)" = src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+          sha256sum "$src" | cut -d' ' -f1 > "$RUNNER_TEMP/patched-source.sha256"
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Original Docker cross environment
@@ -59,14 +72,18 @@ jobs:
           cache-from: type=gha,scope=mesa-cross-env
           cache-to: type=gha,mode=max,scope=mesa-cross-env,ignore-error=true
 
-      - name: Build pinned guest with unchanged recipe
+      - name: Build pinned guest with minimal modifier fix
         env:
           MESA_NO_IMAGE_BUILD: '1'
         shell: bash
         run: |
           set -euo pipefail
           bash ./ci-build.sh droidvm "$PWD/out"
-          git -C "$MESA_SRC_DIR" diff --exit-code HEAD --
+          src="$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp"
+          python3 -I ./patch-guest-modifier.py "$src" --check-against "$RUNNER_TEMP/ResourceTracker.base.cpp" | tee out/patch-checks-after-build.txt
+          test "$(sha256sum "$src" | cut -d' ' -f1)" = "$(< "$RUNNER_TEMP/patched-source.sha256")"
+          test "$(git -C "$MESA_SRC_DIR" diff --name-only HEAD --)" = src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+          git -C "$MESA_SRC_DIR" diff --check
           grep -Fx "MESA_COMMIT=$MESA_COMMIT" out/build.env
 
       - name: Record provenance and inspect AArch64 dependencies
@@ -80,6 +97,9 @@ jobs:
             printf 'RUN_URL=%s\nRECIPE_REPOSITORY=%s\nRECIPE_REF=%s\nRECIPE_SHA=%s\n' "$RUN_URL" "$GITHUB_REPOSITORY" "$GITHUB_REF" "$RECIPE_SHA"
             printf 'MESA_URL=%s\nVULKAN_HEADERS=1.4.358\nRELEASE=false\n' "$MESA_URL"
             printf 'MESA_TREE=%s\n' "$(git -C "$MESA_SRC_DIR" rev-parse 'HEAD^{tree}')"
+            printf 'MESA_PATCH=guest-modifier-pnext-v1\nMESA_WORKTREE_DIRTY=true\n'
+            printf 'PATCHED_SOURCE_SHA256=%s\n' "$(< "$RUNNER_TEMP/patched-source.sha256")"
+            sha256sum patch-guest-modifier.py out/guest-modifier.patch
             docker image inspect droidvm-mesa-cross:latest --format 'DOCKER_IMAGE_ID={{.Id}}'
             sha256sum Dockerfile.mesa-cross build.sh build-in-container.sh ci-build.sh mesa-config.sh package.sh aarch64-linux-gnu.meson aarch64-llvm-config ubuntu.sources
           } > out/provenance.txt
