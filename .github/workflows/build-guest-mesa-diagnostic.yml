@@ -1,0 +1,111 @@
+name: guest mesa diagnostic (artifact only)
+
+on:
+  push:
+    branches: [diagnostic/mali-guest-mesa]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Artifact only; releases are never published by this workflow'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guest-mesa-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MESA_COMMIT: cecc0e96d7193c72356a31abb0cc589e4fc0415e
+  MESA_URL: https://github.com/Droid-VM/mesa.git
+  MESA_SRC_DIR: ${{ github.workspace }}/mesa
+
+jobs:
+  build:
+    if: github.repository == 'collegeming/mesa-cross' && inputs.release != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch exact Mesa source and verify paired headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init "$MESA_SRC_DIR"
+          git -C "$MESA_SRC_DIR" remote add origin "$MESA_URL"
+          # Full history retains the original recipe's monotonic package version.
+          git -C "$MESA_SRC_DIR" fetch --filter=blob:none origin "$MESA_COMMIT"
+          git -C "$MESA_SRC_DIR" checkout --detach FETCH_HEAD
+          test "$(git -C "$MESA_SRC_DIR" rev-parse HEAD)" = "$MESA_COMMIT"
+          test "$(git -C "$MESA_SRC_DIR" rev-parse --is-shallow-repository)" = false
+          grep -Eq '^#define VK_HEADER_VERSION +358$' "$MESA_SRC_DIR/include/vulkan/vulkan_core.h"
+          grep -Eq '^#define VK_HEADER_VERSION_COMPLETE VK_MAKE_API_VERSION\(0, 1, 4, VK_HEADER_VERSION\)$' "$MESA_SRC_DIR/include/vulkan/vulkan_core.h"
+          git -C "$MESA_SRC_DIR" diff --exit-code HEAD --
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Original Docker cross environment
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.mesa-cross
+          tags: droidvm-mesa-cross:latest
+          load: true
+          cache-from: type=gha,scope=mesa-cross-env
+          cache-to: type=gha,mode=max,scope=mesa-cross-env,ignore-error=true
+
+      - name: Build pinned guest with unchanged recipe
+        env:
+          MESA_NO_IMAGE_BUILD: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./ci-build.sh droidvm "$PWD/out"
+          git -C "$MESA_SRC_DIR" diff --exit-code HEAD --
+          grep -Fx "MESA_COMMIT=$MESA_COMMIT" out/build.env
+
+      - name: Record provenance and inspect AArch64 dependencies
+        shell: bash
+        env:
+          RECIPE_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            printf 'RUN_URL=%s\nRECIPE_REPOSITORY=%s\nRECIPE_REF=%s\nRECIPE_SHA=%s\n' "$RUN_URL" "$GITHUB_REPOSITORY" "$GITHUB_REF" "$RECIPE_SHA"
+            printf 'MESA_URL=%s\nVULKAN_HEADERS=1.4.358\nRELEASE=false\n' "$MESA_URL"
+            printf 'MESA_TREE=%s\n' "$(git -C "$MESA_SRC_DIR" rev-parse 'HEAD^{tree}')"
+            docker image inspect droidvm-mesa-cross:latest --format 'DOCKER_IMAGE_ID={{.Id}}'
+            sha256sum Dockerfile.mesa-cross build.sh build-in-container.sh ci-build.sh mesa-config.sh package.sh aarch64-linux-gnu.meson aarch64-llvm-config ubuntu.sources
+          } > out/provenance.txt
+          docker run --rm -v "$PWD/out:/out" -v "$MESA_SRC_DIR:/mesa:ro" droidvm-mesa-cross:latest bash -euo pipefail -c '
+            dpkg-query -W > /out/build-packages.txt
+            dpkg-deb -f /out/*.deb > /out/debian-control.txt
+            root=$(mktemp -d)
+            dpkg-deb -x /out/*.deb "$root"
+            find "$root" -type f -name "*.so*" -print0 | while IFS= read -r -d "" so; do
+              printf "\n=== %s ===\n" "${so#"$root"}"
+              aarch64-linux-gnu-readelf -h "$so" | grep Machine
+              aarch64-linux-gnu-readelf -d "$so" | grep -E "NEEDED|SONAME|RPATH|RUNPATH" || true
+              aarch64-linux-gnu-readelf --version-info "$so" | grep -E "Name: (GLIBC|GLIBCXX|CXXABI)" || true
+            done > /out/elf-dependencies.txt
+            test -n "$(find "$root" -name "libvulkan_gfxstream.so" -print -quit)"
+            test -n "$(find "$root" -name "libEGL_mesa.so*" -print -quit)"
+            test -n "$(find "$root" -name "libgbm.so*" -print -quit)"
+            cp /mesa/build-cross/meson-info/intro-buildoptions.json /out/meson-buildoptions.json
+            cp /mesa/build-cross/meson-logs/meson-log.txt /out/meson-log.txt
+          '
+          (cd out && sha256sum *.deb > SHA256SUMS)
+          printf 'Artifact only: %s\n\nMesa: %s\n\nVulkan Headers: 1.4.358\n' "$RUN_URL" "$MESA_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesa-guest-deb
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
