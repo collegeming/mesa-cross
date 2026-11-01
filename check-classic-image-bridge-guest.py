@@ -73,8 +73,10 @@ for text in ['#include "vk_android_native_buffer_gfxstream.h"',
 assert 'VirtGpuResourcePtr classicBridgeResource = nullptr' in rh
 assert 'VkImage classicBridgeImage = VK_NULL_HANDLE' in rh
 assert rt.index('cib1Resource = gpu->createResource') < rt.index('VkMemoryRequirements memReqs;', rt.index('cib1Resource = gpu->createResource'))
-query = rt[rt.index('    if (cib1Query) {'):rt.index('#ifdef LINUX_GUEST_BUILD', rt.index('    if (cib1Query) {'))]
+result_start = rt.index('    if (hostRes != VK_SUCCESS) return hostRes;')
+query_start = rt.index('    if (cib1Query) {', result_start)
+query = rt[query_start:rt.index('#ifdef LINUX_GUEST_BUILD', query_start)]
 assert 'IMPORTABLE_BIT' not in query
-assert 'hostRes != VK_SUCCESS) return hostRes;' in rt[:rt.index('    if (cib1Query) {')]
+assert result_start < query_start
 print('PASS CIB1 120/124/128 cap append; zero-tail GET_CAPS-success witness; exact marker; classic GEM before native image; authoritative nonzero CB size/DEVICE_LOCAL-only req; dedicated allocation/single bind; map/import rejection; guest PRIME export; EXPORTABLE|DEDICATED_ONLY query exact request type')
 print('LIMIT source checks and compilation do not establish native AHB or desktop runtime correctness; paired host required; bridge FD import intentionally unsupported')
