@@ -281,9 +281,15 @@ edit(rt, '''    bool hasDedicatedImage = false;
         if (image != info_VkImage.end() && image->second.classicBridgeResource) {
             auto& ci = image->second;
             const auto* exportInfo = vk_find_struct_const(pAllocateInfo, EXPORT_MEMORY_ALLOCATE_INFO);
-            if (ci.device != device || ci.classicBridgeAllocated || !exportInfo ||
-                !cib1Handles(exportInfo->handleTypes) || cib1Dedicated->buffer ||
-                vk_find_struct_const(pAllocateInfo, IMPORT_MEMORY_FD_INFO_KHR) ||
+            const auto* importFdInfo = vk_find_struct_const(pAllocateInfo, IMPORT_MEMORY_FD_INFO_KHR);
+            // Linux compositors hand over an existing dmabuf with VkImportMemoryFdInfoKHR, while
+            // the Android gralloc path exports an AHB. Either way the pixels already live on the
+            // host and the bridge replaces the request with the classic ColorBuffer import; the
+            // fd is never sent to the host.
+            const bool cib1Backing =
+                exportInfo ? (cib1Handles(exportInfo->handleTypes) != 0) : (importFdInfo != nullptr);
+            if (ci.device != device || ci.classicBridgeAllocated || !cib1Backing ||
+                cib1Dedicated->buffer ||
                 pAllocateInfo->allocationSize != ci.baseRequirements.size ||
                 pAllocateInfo->memoryTypeIndex >= 32 ||
                 !(ci.baseRequirements.memoryTypeBits & (1u << pAllocateInfo->memoryTypeIndex)))
