@@ -133,16 +133,26 @@ edit(rt, '''    if (extImgCiPtr) {
 #if defined(LINUX_GUEST_BUILD)''', '''#if defined(LINUX_GUEST_BUILD)
     const auto* cib1ViewsInfo = vk_find_struct_const(pCreateInfo, IMAGE_FORMAT_LIST_CREATE_INFO);
     const auto* cib1Modifier = vk_find_struct_const(pCreateInfo, IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+    const auto* cib1Explicit = vk_find_struct_const(pCreateInfo, IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+    // DRI3/dmabuf imports arrive as DRM_FORMAT_MODIFIER_EXT with an explicit LINEAR modifier and
+    // its plane layout. The base emulation path already reduces those to a LINEAR wire image; the
+    // bridge can stand in for the same images, it just has to recognise the explicit form too.
+    const bool cib1ExplicitLinear = cib1Explicit &&
+        cib1Explicit->drmFormatModifier == DRM_FORMAT_MOD_LINEAR &&
+        cib1Explicit->drmFormatModifierPlaneCount == 1 && cib1Explicit->pPlaneLayouts &&
+        cib1Explicit->pPlaneLayouts[0].offset == 0;
     const bool cib1Linear = pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR ||
-        (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && cib1Modifier &&
-         cib1Modifier->drmFormatModifierCount == 1 && cib1Modifier->pDrmFormatModifiers &&
-         cib1Modifier->pDrmFormatModifiers[0] == DRM_FORMAT_MOD_LINEAR);
+        (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+         ((cib1Modifier && cib1Modifier->drmFormatModifierCount == 1 &&
+           cib1Modifier->pDrmFormatModifiers &&
+           cib1Modifier->pDrmFormatModifiers[0] == DRM_FORMAT_MOD_LINEAR) ||
+          cib1ExplicitLinear));
     cib1 = mCaps.classicImageBridgeAck && extImgCiPtr &&
         cib1Handles(extImgCiPtr->handleTypes) && cib1Linear &&
         cib1Views(pCreateInfo->format, pCreateInfo->flags, cib1ViewsInfo) &&
         pCreateInfo->sharingMode == VK_SHARING_MODE_EXCLUSIVE &&
         pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
-        !vk_find_struct_const(pCreateInfo, IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT) &&
+        (!cib1Explicit || cib1Explicit->drmFormatModifier == DRM_FORMAT_MOD_LINEAR) &&
         cib1Geometry(pCreateInfo->imageType, pCreateInfo->format, pCreateInfo->flags,
             pCreateInfo->usage, pCreateInfo->extent.depth, pCreateInfo->mipLevels,
             pCreateInfo->arrayLayers, pCreateInfo->samples);
@@ -150,6 +160,10 @@ edit(rt, '''    if (extImgCiPtr) {
         const uint32_t width = pCreateInfo->extent.width, height = pCreateInfo->extent.height;
         uint32_t stride = 0, bytes = 0;
         if (!cib1Layout(width, height, &stride, &bytes)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        // The importer's plane layout is the contract the buffer was handed over with; the classic
+        // image can only stand in for it when the strides agree.
+        if (cib1Explicit && cib1Explicit->pPlaneLayouts[0].rowPitch != stride)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
         auto* gpu = VirtGpuDevice::getInstance();
         if (!gpu) return VK_ERROR_INITIALIZATION_FAILED;
         const uint32_t vf = gfxstream::vk::getVirglFormat(pCreateInfo->format);
