@@ -9,13 +9,21 @@ rh = (root / 'src/gfxstream/guest/vulkan_enc/ResourceTracker.h').read_text()
 cap = (root / 'src/virtio/virtio-gpu/virtgpu_gfxstream_protocol.h').read_text()
 drm = (root / 'src/gfxstream/guest/platform/drm/DrmVirtGpuDevice.cpp').read_text()
 changed = subprocess.check_output(['git', '-C', str(root), 'diff', '--name-only', 'HEAD', '--'], text=True).splitlines()
-assert set(changed) == {
+cib_files = {
     'src/virtio/virtio-gpu/virtgpu_gfxstream_protocol.h',
     'src/gfxstream/guest/platform/include/VirtGpu.h',
     'src/gfxstream/guest/platform/drm/DrmVirtGpuDevice.cpp',
     'src/gfxstream/guest/vulkan_enc/ResourceTracker.h',
     'src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp',
 }
+# The ring-wakeup patch is applied after this checker has already run once; on the post-build
+# run it is present in the same diff. Allowing exactly those two extra files keeps the CIB file
+# set exact (nothing added or removed) while not rejecting the later, unrelated patch.
+ring_files = {
+    'src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp',
+    'src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h',
+}
+assert set(changed) in (cib_files, cib_files | ring_files), set(changed)
 for text in ['sizeof(vulkanCapset) == 128', 'classicImageBridgeVersion) == 120',
              'classicImageBridgeContract) == 124']:
     assert text in cap, text
