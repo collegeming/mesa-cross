@@ -38,13 +38,27 @@ NEW = '''    VkEncoder* enc = (VkEncoder*)context;
                 vk_find_struct_const(pCreateInfo, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
             const auto* diagExplicit = vk_find_struct_const(
                 pCreateInfo, IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+            const auto* diagModList = vk_find_struct_const(
+                pCreateInfo, IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+            const auto* diagViews =
+                vk_find_struct_const(pCreateInfo, IMAGE_FORMAT_LIST_CREATE_INFO);
+            const uint64_t diagMod0 =
+                (diagModList && diagModList->drmFormatModifierCount > 0 &&
+                 diagModList->pDrmFormatModifiers)
+                    ? diagModList->pDrmFormatModifiers[0]
+                    : ~0ull;
             mesa_logw(
                 "IMG-CREATE: fmt=%u type=%u extent=%ux%u tiling=%u usage=0x%x flags=0x%x "
-                "ext=0x%x sharing=%u initial=%u explicit=%d",
+                "ext=0x%x sharing=%u initial=%u explicit=%d modlist=%d mod0=0x%llx "
+                "views=%u view0=%u view1=%u",
                 pCreateInfo->format, pCreateInfo->imageType, pCreateInfo->extent.width,
                 pCreateInfo->extent.height, pCreateInfo->tiling, pCreateInfo->usage,
                 pCreateInfo->flags, diagExt ? diagExt->handleTypes : 0,
-                pCreateInfo->sharingMode, pCreateInfo->initialLayout, diagExplicit ? 1 : 0);
+                pCreateInfo->sharingMode, pCreateInfo->initialLayout, diagExplicit ? 1 : 0,
+                diagModList ? 1 : 0, (unsigned long long)diagMod0,
+                diagViews ? diagViews->viewFormatCount : 0,
+                (diagViews && diagViews->viewFormatCount > 0) ? diagViews->pViewFormats[0] : 0,
+                (diagViews && diagViews->viewFormatCount > 1) ? diagViews->pViewFormats[1] : 0);
         }
     }
 #endif
