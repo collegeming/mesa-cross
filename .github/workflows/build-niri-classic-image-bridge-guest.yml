@@ -1,11 +1,11 @@
-name: niri ring wake guest (artifact only)
+name: dedicated host-visible guest (artifact only)
 on:
   push:
-    branches: [diagnostic/niri-ring-wake-guest2]
+    branches: [diagnostic/guest-dedicated-hostvisible]
 permissions:
   contents: read
 concurrency:
-  group: niri-ring-wake-guest2-${{ github.ref }}
+  group: guest-dedicated-hostvisible-${{ github.ref }}
   cancel-in-progress: false
 env:
   MESA_COMMIT: cecc0e96d7193c72356a31abb0cc589e4fc0415e
@@ -14,7 +14,7 @@ env:
   MESA_SRC_DIR: ${{ github.workspace }}/mesa
 jobs:
   build:
-    if: github.repository == 'collegeming/mesa-cross' && github.ref == 'refs/heads/diagnostic/niri-ring-wake-guest2'
+    if: github.repository == 'collegeming/mesa-cross' && github.ref == 'refs/heads/diagnostic/guest-dedicated-hostvisible'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -40,7 +40,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends g++ binutils python3
           sha256sum Dockerfile.mesa-cross build.sh build-in-container.sh ci-build.sh mesa-config.sh package.sh aarch64-linux-gnu.meson aarch64-llvm-config ubuntu.sources > out/recipe-files.sha256
           printf '%s  %s\n' a8bf4c14c20bf98c0d0c95fe8c7ab6cabce2eff6f1499a302dc67832a4cce1a7 "$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp" | sha256sum -c -
-      - name: Apply existing modifier fix then CIB1 and inspect exact scope
+      - name: Apply modifier, CIB1, GBM and dedicated host-visible patches; inspect scope
         shell: bash
         run: |
           set -euo pipefail
@@ -52,6 +52,9 @@ jobs:
           python3 -I patch-create-diag-guest.py "$MESA_SRC_DIR" | tee out/create-diag-patch.txt
           python3 -I patch-gbm-host3d-guest.py "$MESA_SRC_DIR" | tee out/gbm-host3d-patch.txt
           grep -q 'gfxstreamGbmHost3d' "$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp"
+          python3 -I patch-guest-dedicated-hostvisible.py "$MESA_SRC_DIR" --diff out/guest-dedicated-hostvisible.patch | tee out/dedicated-hostvisible-patch.txt
+          grep -q 'hostVisibleExternalImageDedicated' "$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp"
+          ! grep -q 'shouldPassThroughDedicatedAllocInfo &= !requestedMemoryIsHostVisible;' "$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp"
           # patch-alloc-diag-guest.py is intentionally not applied: its anchor no longer
           # matches after the CIB1 edits ("expected one allocate anchor, found 0").
           git -C "$MESA_SRC_DIR" diff --check
@@ -101,8 +104,9 @@ jobs:
             printf 'EXECUTION=Actions compile/source checks only; no guest GPU execution; first runtime acceptance actual niri desktop on paired host\n'
             printf 'RING_WAKE=host re-reads both rings after arming NEED_NOTIFY; guest type1Write outstanding/space waits use backoff+deepWaitWantsPing; guest ICD also carries modifier, CIB1 and no-view-list fixes\n'
             printf 'RING_WAKE_DIAG=one log line per stream at the first occurrence of each type1Write wait: ring pointer, raw write/read positions, available, limit, host_state\n'
+            printf 'DEDICATED_HOSTVISIBLE=host-visible allocation dedicated to an external VkImage keeps VkMemoryDedicatedAllocateInfo; external buffers and non-external images unchanged\n'
             docker image inspect droidvm-mesa-cross:latest --format 'DOCKER_IMAGE_ID={{.Id}}'
-            sha256sum patch-guest-modifier.py patch-classic-image-bridge-guest.py check-classic-image-bridge-guest.py test-classic-image-bridge-guest.py patch-ring-wake-guest.py check-ring-wake-guest.py patch-ring-wake-diag-guest.py check-ring-wake-diag-guest.py
+            sha256sum patch-guest-modifier.py patch-classic-image-bridge-guest.py check-classic-image-bridge-guest.py test-classic-image-bridge-guest.py patch-ring-wake-guest.py check-ring-wake-guest.py patch-ring-wake-diag-guest.py check-ring-wake-diag-guest.py patch-guest-dedicated-hostvisible.py
           } > out/provenance.txt
           docker run --rm -v "$PWD/out:/out" -v "$MESA_SRC_DIR:/mesa:ro" droidvm-mesa-cross:latest bash -euo pipefail -c '
             dpkg-query -W > /out/build-packages.txt
@@ -116,11 +120,11 @@ jobs:
             cp /mesa/build-cross/meson-info/intro-buildoptions.json /out/meson-buildoptions.json
             cp /mesa/build-cross/meson-logs/meson-log.txt /out/meson-log.txt
           '
-          cp patch-guest-modifier.py patch-classic-image-bridge-guest.py check-classic-image-bridge-guest.py test-classic-image-bridge-guest.py patch-cib1-reason-guest.py patch-create-diag-guest.py patch-gbm-host3d-guest.py patch-alloc-diag-guest.py patch-ring-wake-guest.py check-ring-wake-guest.py patch-ring-wake-diag-guest.py check-ring-wake-diag-guest.py .github/workflows/build-niri-classic-image-bridge-guest.yml out/
+          cp patch-guest-modifier.py patch-classic-image-bridge-guest.py check-classic-image-bridge-guest.py test-classic-image-bridge-guest.py patch-cib1-reason-guest.py patch-create-diag-guest.py patch-gbm-host3d-guest.py patch-guest-dedicated-hostvisible.py patch-alloc-diag-guest.py patch-ring-wake-guest.py check-ring-wake-guest.py patch-ring-wake-diag-guest.py check-ring-wake-diag-guest.py .github/workflows/build-niri-classic-image-bridge-guest.yml out/
           (cd out && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: niri-ring-wake-guest2
+          name: guest-dedicated-hostvisible
           path: out/
           if-no-files-found: error
           retention-days: 30
