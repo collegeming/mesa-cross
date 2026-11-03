@@ -487,7 +487,6 @@ edit(rt, '''    if (!info.coherentMemory) {
                               true)) {
             bridgeImage->second.classicBridgeMemory = VK_NULL_HANDLE;
             bridgeImage->second.classicBridgeAllocated = false;
-            bridgeImage->second.classicBridgeBound = false;
         }
         info.classicBridgeImage = VK_NULL_HANDLE;
         info.classicBridgeBound = false;
@@ -522,7 +521,6 @@ edit(rt, '''    VkEncoder* enc = (VkEncoder*)context;
                 ii.classicBridgeMemory = VK_NULL_HANDLE;
             }
             ii.classicBridgeAllocated = false;
-            ii.classicBridgeBound = false;
             // Keep the staging GEM resource alive past the host destroy; see cib1Retire().
             cib1Retire(ii.classicBridgeResource);
         }
