@@ -79,8 +79,9 @@ text = text.replace(old, new, 1)
 
 # 4) HOST3D blobs need MAPPABLE so the guest can map them.
 old = '                createBlob.flags = kBlobFlagShareable | kBlobFlagCrossDevice;'
-new = ('                createBlob.flags = kBlobFlagShareable | kBlobFlagCrossDevice |\n'
-       '                                   (gfxstreamGbmHost3d() ? kBlobFlagMappable : 0);')
+new = ('                createBlob.flags = static_cast<VirtGpuResourceFlags>(\n'
+       '                    kBlobFlagShareable | kBlobFlagCrossDevice |\n'
+       '                    (gfxstreamGbmHost3d() ? kBlobFlagMappable : 0));')
 if text.count(old) != 2:
     raise SystemExit(f'host3d flags anchor count {text.count(old)}')
 text = text.replace(old, new)
