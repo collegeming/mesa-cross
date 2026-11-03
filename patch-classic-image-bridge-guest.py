@@ -147,8 +147,16 @@ edit(rt, '''    if (extImgCiPtr) {
            cib1Modifier->pDrmFormatModifiers &&
            cib1Modifier->pDrmFormatModifiers[0] == DRM_FORMAT_MOD_LINEAR) ||
           cib1ExplicitLinear));
+    // Keep DMA_BUF (WSI/GBM scanout) images on their imported guest memory unless
+    // explicitly requested. The bridge's host ColorBuffer cannot be the guest's
+    // scanout buffer, so converting it disconnects the compositor output.
+    const bool cib1DmabufAllowed = getenv("GFXSTREAM_CIB_ALLOW_DMABUF") != nullptr;
+    const bool cib1DmabufExcluded = extImgCiPtr &&
+        (extImgCiPtr->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
+        !cib1DmabufAllowed;
     cib1 = mCaps.classicImageBridgeAck && extImgCiPtr &&
         cib1Handles(extImgCiPtr->handleTypes) && cib1Linear &&
+        !cib1DmabufExcluded &&
         cib1Views(pCreateInfo->format, pCreateInfo->flags, cib1ViewsInfo) &&
         pCreateInfo->sharingMode == VK_SHARING_MODE_EXCLUSIVE &&
         pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
