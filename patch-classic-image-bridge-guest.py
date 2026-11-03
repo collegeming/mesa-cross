@@ -3,7 +3,9 @@
 No local compilation/execution authorization. Native requirements come from paired host CB.
 The dedicated allocation branch takes the ColorBuffer import even when the app's allocation
 names no export/import handle: the bridge owns the backing, so that metadata cannot decide
-whether the image binds.
+whether the image binds. The image owns the GEM staging resource, allocation is claimed and
+released exactly once through classicBridgeMemory, and the resource is retired until process
+exit instead of being closed while the host may still drain work into its pages.
 """
 import argparse
 from pathlib import Path
@@ -61,6 +63,7 @@ edit(rh, '        VkDeviceMemory currentBacking = VK_NULL_HANDLE;\n        VkDev
         VkMemoryRequirements baseRequirements;
         VirtGpuResourcePtr classicBridgeResource = nullptr;
         bool classicBridgeAllocated = false;
+        VkDeviceMemory classicBridgeMemory = VK_NULL_HANDLE;
 #ifdef VK_USE_PLATFORM_ANDROID_KHR''')
 # Base images are UNORM; bounded mutable views stay inside the matching channel family.
 helpers = '''#if defined(LINUX_GUEST_BUILD)
@@ -100,16 +103,57 @@ static bool cib1Layout(uint32_t width, uint32_t height, uint32_t* stride, uint32
     return true;
 }
 static bool cib1BindIdentity(bool imageBridge, bool memoryBridge, bool sameImage,
-                             bool sameOwner, bool alreadyBound, VkDeviceSize offset) {
-    return imageBridge && memoryBridge && sameImage && sameOwner && !alreadyBound && !offset;
+                             bool sameOwner, bool sameMemory, bool alreadyBound,
+                             VkDeviceSize offset) {
+    return imageBridge && memoryBridge && sameImage && sameOwner && sameMemory &&
+        !alreadyBound && !offset;
 }
 static bool cib1RetainAllocation(bool imageExists, bool sameOwner, bool hostSuccess) {
     return imageExists && sameOwner && hostSuccess;
+}
+// The image is the single owner of the GEM staging resource; the memory holds a second
+// shared reference only so export can reach it. Allocation is claimed exactly once and
+// released exactly once, keyed by the image/memory pair.
+static bool cib1BridgeClaim(bool imageAlive, bool sameDevice, bool alreadyAllocated,
+                            bool dedicatedBuffer, bool sizeMatches, bool indexValid) {
+    return imageAlive && sameDevice && !alreadyAllocated && !dedicatedBuffer &&
+        sizeMatches && indexValid;
+}
+static bool cib1BridgeRelease(bool imageAlive, bool sameMemory, bool memoryAlive) {
+    return imageAlive && sameMemory && memoryAlive;
 }
 static bool cib1Handles(VkExternalMemoryHandleTypeFlags handles) {
     const auto allowed = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
                          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     return handles && !(handles & ~allowed);
+}
+#endif
+
+#if defined(LINUX_GUEST_BUILD)
+// The guest flushes vkFreeMemory/vkDestroyImage and immediately runs the encoder's destroy
+// mapping, but the host may still be draining ring commands and GPU work that writes into
+// the ColorBuffer backed by this staging resource. Closing the GEM handle there hands the
+// pages back to the guest allocator while the host still writes them, which corrupts
+// unrelated guest memory. Retire the resource instead: it is released once, at process exit.
+// The host already keeps the matching AHB reference for the same reason.
+static bool cib1DiagEnabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("GFXSTREAM_CIB_ALLOC_DIAG");
+        return v && v[0] && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+static void cib1Retire(VirtGpuResourcePtr& resource) {
+    if (!resource) return;
+    const uint32_t handle = resource->getResourceHandle();
+    static std::vector<VirtGpuResourcePtr>* retired =
+        new std::vector<VirtGpuResourcePtr>();  // process lifetime by design
+    retired->push_back(std::move(resource));
+    static std::atomic<uint32_t> retiredCount{0};
+    const uint32_t count = retiredCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (cib1DiagEnabled() && (count <= 64 || (count % 64) == 0)) {
+        mesa_logw("CIB1-RETIRE: resource=%u retired=%u kept-until-exit", handle, count);
+    }
 }
 #endif
 
@@ -299,15 +343,14 @@ edit(rt, '''    bool hasDedicatedImage = false;
             // ColorBuffer import; the fd is never sent to the host. A genuine mismatch below
             // still fails closed.
             const bool cib1Eligible =
-                ci.device == device && !ci.classicBridgeAllocated && !cib1Dedicated->buffer &&
-                pAllocateInfo->allocationSize == ci.baseRequirements.size &&
-                pAllocateInfo->memoryTypeIndex < 32 &&
-                (ci.baseRequirements.memoryTypeBits & (1u << pAllocateInfo->memoryTypeIndex));
-            static const bool cib1AllocDiagEnabled = [] {
-                const char* v = getenv("GFXSTREAM_CIB_ALLOC_DIAG");
-                return v && v[0] && strcmp(v, "0") != 0;
-            }();
-            if (cib1AllocDiagEnabled) {
+                cib1BridgeClaim(image != info_VkImage.end(), ci.device == device,
+                                ci.classicBridgeAllocated,
+                                cib1Dedicated->buffer != VK_NULL_HANDLE,
+                                pAllocateInfo->allocationSize == ci.baseRequirements.size,
+                                pAllocateInfo->memoryTypeIndex < 32 &&
+                                    (ci.baseRequirements.memoryTypeBits &
+                                     (1u << pAllocateInfo->memoryTypeIndex)));
+            if (cib1DiagEnabled()) {
                 static std::atomic<uint32_t> sCib1AllocDiagLogs{0};
                 if (sCib1AllocDiagLogs.fetch_add(1, std::memory_order_relaxed) < 64) {
                     mesa_logw(
@@ -335,7 +378,10 @@ edit(rt, '''    bool hasDedicatedImage = false;
             lock.lock();
             image = info_VkImage.find(cib1Dedicated->image);
             if (result != VK_SUCCESS) {
-                if (image != info_VkImage.end()) image->second.classicBridgeAllocated = false;
+                if (image != info_VkImage.end()) {
+                    image->second.classicBridgeAllocated = false;
+                    image->second.classicBridgeMemory = VK_NULL_HANDLE;
+                }
                 return result;
             }
             // Valid Vulkan callers keep the image alive through allocation. Retain GEM
@@ -343,6 +389,10 @@ edit(rt, '''    bool hasDedicatedImage = false;
             if (!cib1RetainAllocation(image != info_VkImage.end(),
                     image != info_VkImage.end() && image->second.classicBridgeResource == owner,
                     result == VK_SUCCESS)) {
+                if (image != info_VkImage.end()) {
+                    image->second.classicBridgeAllocated = false;
+                    image->second.classicBridgeMemory = VK_NULL_HANDLE;
+                }
                 lock.unlock();
                 enc->vkFreeMemory(device, *pMemory, pAllocator, true);
                 *pMemory = VK_NULL_HANDLE;
@@ -351,6 +401,7 @@ edit(rt, '''    bool hasDedicatedImage = false;
             setDeviceMemoryInfo(device, *pMemory, pAllocateInfo->allocationSize, nullptr,
                 pAllocateInfo->memoryTypeIndex, nullptr, false, ZX_HANDLE_INVALID, owner, -1);
             info_VkDeviceMemory[*pMemory].classicBridgeImage = cib1Dedicated->image;
+            image->second.classicBridgeMemory = *pMemory;
             return VK_SUCCESS;
         }
     }
@@ -390,7 +441,7 @@ edit(rt, '''    return enc->vkBindImageMemory(device, image, memory, memoryOffse
         if (ii.classicBridgeResource || mi.classicBridgeImage) {
             if (!cib1BindIdentity(ii.classicBridgeResource != nullptr, mi.classicBridgeImage != VK_NULL_HANDLE,
                     mi.classicBridgeImage == image, mi.blobPtr == ii.classicBridgeResource,
-                    mi.classicBridgeBound, memoryOffset))
+                    ii.classicBridgeMemory == memory, mi.classicBridgeBound, memoryOffset))
                 return VK_ERROR_INVALID_EXTERNAL_HANDLE;
             const auto result = enc->vkBindImageMemory(device, image, memory, 0, true);
             if (result == VK_SUCCESS) mi.classicBridgeBound = true;
@@ -417,6 +468,69 @@ edit(rt, '''    return enc->vkBindImageMemory2(device, bindingCount, pBindInfos,
     }
 #endif
     return enc->vkBindImageMemory2(device, bindingCount, pBindInfos, true /* do lock */);''')
+# CIB1 free releases the allocation claim once and retires the GEM resource instead of
+# closing it synchronously while the host may still be draining work into it.
+edit(rt, '''    if (!info.coherentMemory) {
+        lock.unlock();
+        VkEncoder* enc = (VkEncoder*)context;
+        enc->vkFreeMemory(device, memory, pAllocateInfo, true /* do lock */);
+        return;
+    }''', '''#if defined(LINUX_GUEST_BUILD)
+    if (info.classicBridgeImage) {
+        // Clear the allocation claim before the host free. The GEM resource is retired, not
+        // released: the image owns it and the host may still be draining work that writes
+        // into the ColorBuffer backed by these pages.
+        auto bridgeImage = info_VkImage.find(info.classicBridgeImage);
+        if (cib1BridgeRelease(bridgeImage != info_VkImage.end(),
+                              bridgeImage != info_VkImage.end() &&
+                                  bridgeImage->second.classicBridgeMemory == memory,
+                              true)) {
+            bridgeImage->second.classicBridgeMemory = VK_NULL_HANDLE;
+            bridgeImage->second.classicBridgeAllocated = false;
+            bridgeImage->second.classicBridgeBound = false;
+        }
+        info.classicBridgeImage = VK_NULL_HANDLE;
+        info.classicBridgeBound = false;
+        cib1Retire(info.blobPtr);
+    }
+#endif
+    if (!info.coherentMemory) {
+        lock.unlock();
+        VkEncoder* enc = (VkEncoder*)context;
+        enc->vkFreeMemory(device, memory, pAllocateInfo, true /* do lock */);
+        // The encoder's destroy mapping normally unregisters the handle inside the call.
+        // Erase again so the tracker state is idempotent if that mapping is skipped and a
+        // recycled handle can never observe a stale bridge entry.
+        unregister_VkDeviceMemory(memory);
+        return;
+    }''')
+# CIB1 image destroy clears the paired memory's bridge identity and retires the resource.
+edit(rt, '''    VkEncoder* enc = (VkEncoder*)context;
+    enc->vkDestroyImage(device, image, pAllocator, true /* do lock */);
+}''', '''#if defined(LINUX_GUEST_BUILD)
+    {
+        std::lock_guard<std::recursive_mutex> lock(mLock);
+        auto bridgeImage = info_VkImage.find(image);
+        if (bridgeImage != info_VkImage.end() && bridgeImage->second.classicBridgeResource) {
+            auto& ii = bridgeImage->second;
+            if (ii.classicBridgeMemory != VK_NULL_HANDLE) {
+                auto bridgeMemory = info_VkDeviceMemory.find(ii.classicBridgeMemory);
+                if (bridgeMemory != info_VkDeviceMemory.end()) {
+                    bridgeMemory->second.classicBridgeImage = VK_NULL_HANDLE;
+                    bridgeMemory->second.classicBridgeBound = false;
+                }
+                ii.classicBridgeMemory = VK_NULL_HANDLE;
+            }
+            ii.classicBridgeAllocated = false;
+            ii.classicBridgeBound = false;
+            // Keep the staging GEM resource alive past the host destroy; see cib1Retire().
+            cib1Retire(ii.classicBridgeResource);
+        }
+    }
+#endif
+    VkEncoder* enc = (VkEncoder*)context;
+    enc->vkDestroyImage(device, image, pAllocator, true /* do lock */);
+}''')
 # CIB query chain is copied to known local nodes before baseline filter can mutate it.
 edit(rt, '''    VkPhysicalDeviceImageFormatInfo2 localImageFormatInfo = *pImageFormatInfo;
 

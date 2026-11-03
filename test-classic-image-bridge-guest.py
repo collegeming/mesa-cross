@@ -58,17 +58,30 @@ int main() {
     assert(cib1Layout(5,2,&stride,&size)&&stride==32&&size==64);
     assert(!cib1Layout(0,1,&stride,&size)); assert(!cib1Layout(1,0,&stride,&size));
     assert(!cib1Layout(UINT32_MAX,1,&stride,&size)); assert(!cib1Layout(65536,65536,&stride,&size));
-    for(unsigned mask=0;mask<32;++mask) {
-        bool image=mask&1,memory=mask&2,same=mask&4,owner=mask&8,bound=mask&16;
-        assert(cib1BindIdentity(image,memory,same,owner,bound,0)==(mask==15));
-        assert(!cib1BindIdentity(image,memory,same,owner,bound,1));
+    for(unsigned mask=0;mask<64;++mask) {
+        bool image=mask&1,memory=mask&2,same=mask&4,owner=mask&8,sameMem=mask&16,bound=mask&32;
+        assert(cib1BindIdentity(image,memory,same,owner,sameMem,bound,0)==(mask==31));
+        assert(!cib1BindIdentity(image,memory,same,owner,sameMem,bound,1));
     }
     for(unsigned mask=0;mask<8;++mask)
         assert(cib1RetainAllocation(mask&1,mask&2,mask&4)==(mask==7));
+    for(unsigned mask=0;mask<64;++mask) {
+        bool image=mask&1,sameDevice=mask&2,allocated=mask&4,buffer=mask&8,
+             sizeOk=mask&16,indexOk=mask&32;
+        assert(cib1BridgeClaim(image,sameDevice,allocated,buffer,sizeOk,indexOk)==(mask==51));
+    }
+    for(unsigned mask=0;mask<8;++mask) {
+        bool image=mask&1,sameMemory=mask&2,memoryAlive=mask&4;
+        assert(cib1BridgeRelease(image,sameMemory,memoryAlive)==(mask==7));
+    }
+    // Idempotent free: release is refused once the image or the memory is gone.
+    assert(!cib1BridgeRelease(false,true,true));
+    assert(!cib1BridgeRelease(true,true,false));
+    assert(!cib1BridgeRelease(true,false,true));
     assert(!cib1Handles(0)); assert(cib1Handles(VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT));
     assert(cib1Handles(VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT));
     assert(!cib1Handles(VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID));
-    puts("PASS extracted production CIB1 helpers:129 short/full cap copies, failure/version/default-off; geometry/mutable view families incl no-list MUTABLE; overflow/layout;32 bind identity states;8 allocation retention/rollback decisions; no Vulkan linkage or GPU execution");
+    puts("PASS extracted production CIB1 helpers:129 short/full cap copies, failure/version/default-off; geometry/mutable view families incl no-list MUTABLE; overflow/layout;64 bind identity states;8 allocation retention/rollback decisions;64 allocation-claim and 8 single-release/idempotent-free states; no Vulkan linkage or GPU execution");
 }
 '''
 out.mkdir(parents=True, exist_ok=True)
