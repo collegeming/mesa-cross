@@ -105,6 +105,7 @@ jobs:
             printf 'RING_WAKE=host re-reads both rings after arming NEED_NOTIFY; guest type1Write outstanding/space waits use backoff+deepWaitWantsPing; guest ICD also carries modifier, CIB1 and no-view-list fixes\n'
             printf 'RING_WAKE_DIAG=one log line per stream at the first occurrence of each type1Write wait: ring pointer, raw write/read positions, available, limit, host_state\n'
             printf 'DEDICATED_HOSTVISIBLE=host-visible allocation dedicated to an external VkImage keeps VkMemoryDedicatedAllocateInfo; external buffers and non-external images unchanged\n'
+            printf 'CIB1_ALLOC=ColorBuffer import no longer gated on app export/import metadata; GFXSTREAM_CIB_ALLOC_DIAG=1 logs the first 64 CIB1-ALLOC-GUEST decisions\n'
             docker image inspect droidvm-mesa-cross:latest --format 'DOCKER_IMAGE_ID={{.Id}}'
             sha256sum patch-guest-modifier.py patch-classic-image-bridge-guest.py check-classic-image-bridge-guest.py test-classic-image-bridge-guest.py patch-ring-wake-guest.py check-ring-wake-guest.py patch-ring-wake-diag-guest.py check-ring-wake-diag-guest.py patch-guest-dedicated-hostvisible.py
           } > out/provenance.txt

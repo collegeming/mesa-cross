@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """CIB1 export-only guest patch, applied AFTER exact cecc0e96 modifier fix in Actions.
 No local compilation/execution authorization. Native requirements come from paired host CB.
+The dedicated allocation branch takes the ColorBuffer import even when the app's allocation
+names no export/import handle: the bridge owns the backing, so that metadata cannot decide
+whether the image binds.
 """
 import argparse
 from pathlib import Path
@@ -46,7 +49,7 @@ edit(drm, '    // DroidVM: report the pVM guest-alloc pool partition the host an
         mCaps.vulkanCapset.classicImageBridgeContract = 0;
     }
     // DroidVM: report the pVM guest-alloc pool partition the host announced via capset.''')
-edit(rt, '#include "vulkan/vulkan_core.h"', '#include "vulkan/vulkan_core.h"\n#if defined(LINUX_GUEST_BUILD)\n#include "vk_android_native_buffer_gfxstream.h"\n#include <limits>\n#endif')
+edit(rt, '#include "vulkan/vulkan_core.h"', '#include "vulkan/vulkan_core.h"\n#if defined(LINUX_GUEST_BUILD)\n#include "vk_android_native_buffer_gfxstream.h"\n#include <limits>\n#include <atomic>\n#endif')
 edit(rh, '        VirtGpuResourcePtr blobPtr = nullptr;\n', '''        VirtGpuResourcePtr blobPtr = nullptr;
         VkImage classicBridgeImage = VK_NULL_HANDLE;
         bool classicBridgeBound = false;
@@ -290,18 +293,35 @@ edit(rt, '''    bool hasDedicatedImage = false;
             auto& ci = image->second;
             const auto* exportInfo = vk_find_struct_const(pAllocateInfo, EXPORT_MEMORY_ALLOCATE_INFO);
             const auto* importFdInfo = vk_find_struct_const(pAllocateInfo, IMPORT_MEMORY_FD_INFO_KHR);
-            // Linux compositors hand over an existing dmabuf with VkImportMemoryFdInfoKHR, while
-            // the Android gralloc path exports an AHB. Either way the pixels already live on the
-            // host and the bridge replaces the request with the classic ColorBuffer import; the
-            // fd is never sent to the host.
-            const bool cib1Backing =
-                exportInfo ? (cib1Handles(exportInfo->handleTypes) != 0) : (importFdInfo != nullptr);
-            if (ci.device != device || ci.classicBridgeAllocated || !cib1Backing ||
-                cib1Dedicated->buffer ||
-                pAllocateInfo->allocationSize != ci.baseRequirements.size ||
-                pAllocateInfo->memoryTypeIndex >= 32 ||
-                !(ci.baseRequirements.memoryTypeBits & (1u << pAllocateInfo->memoryTypeIndex)))
-                return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            // The bridge owns the ColorBuffer backing. A compositor allocation that names
+            // neither VkExportMemoryAllocateInfo nor VkImportMemoryFdInfoKHR still has to bind
+            // to it, so export/import metadata is informational only and must not skip the
+            // ColorBuffer import; the fd is never sent to the host. A genuine mismatch below
+            // still fails closed.
+            const bool cib1Eligible =
+                ci.device == device && !ci.classicBridgeAllocated && !cib1Dedicated->buffer &&
+                pAllocateInfo->allocationSize == ci.baseRequirements.size &&
+                pAllocateInfo->memoryTypeIndex < 32 &&
+                (ci.baseRequirements.memoryTypeBits & (1u << pAllocateInfo->memoryTypeIndex));
+            static const bool cib1AllocDiagEnabled = [] {
+                const char* v = getenv("GFXSTREAM_CIB_ALLOC_DIAG");
+                return v && v[0] && strcmp(v, "0") != 0;
+            }();
+            if (cib1AllocDiagEnabled) {
+                static std::atomic<uint32_t> sCib1AllocDiagLogs{0};
+                if (sCib1AllocDiagLogs.fetch_add(1, std::memory_order_relaxed) < 64) {
+                    mesa_logw(
+                        "CIB1-ALLOC-GUEST: image=%p bridge=1 dedicated=1 export=0x%x importFd=%d "
+                        "size=%llu req=%llu index=%u bits=0x%x decided=%s",
+                        (void*)cib1Dedicated->image, exportInfo ? exportInfo->handleTypes : 0,
+                        importFdInfo ? importFdInfo->fd : -1,
+                        (unsigned long long)pAllocateInfo->allocationSize,
+                        (unsigned long long)ci.baseRequirements.size,
+                        pAllocateInfo->memoryTypeIndex, ci.baseRequirements.memoryTypeBits,
+                        cib1Eligible ? "bridge" : "reject");
+                }
+            }
+            if (!cib1Eligible) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
             auto owner = ci.classicBridgeResource;
             ci.classicBridgeAllocated = true;
             VkMemoryAllocateInfo local = *pAllocateInfo;
