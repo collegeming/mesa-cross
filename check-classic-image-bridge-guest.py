@@ -75,7 +75,13 @@ for text in ['#include "vk_android_native_buffer_gfxstream.h"',
              'VkImportColorBufferGOOGLE cb',
              'vk_find_struct_const(pAllocateInfo, IMPORT_MEMORY_FD_INFO_KHR)',
              'const bool cib1Eligible =',
-             'ci.device == device && !ci.classicBridgeAllocated && !cib1Dedicated->buffer',
+             'cib1BridgeClaim(image != info_VkImage.end(), ci.device == device',
+             'cib1BridgeRelease(bridgeImage != info_VkImage.end()',
+             'ii.classicBridgeMemory == memory',
+             'image->second.classicBridgeMemory = *pMemory',
+             'cib1Retire(info.blobPtr)',
+             'cib1Retire(ii.classicBridgeResource)',
+             'unregister_VkDeviceMemory(memory)',
              'pAllocateInfo->memoryTypeIndex < 32',
              'CIB1-ALLOC-GUEST: image=%p bridge=1 dedicated=1',
              'GFXSTREAM_CIB_ALLOC_DIAG',
@@ -103,6 +109,7 @@ assert 'cib1ViewFormats[0] = pCreateInfo->format;\n            cib1ViewFormats[1
 assert create_block.index('if (cib1ViewsInfo)') < create_block.index(
     'else if (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)')
 assert 'VirtGpuResourcePtr classicBridgeResource = nullptr' in rh
+assert 'VkDeviceMemory classicBridgeMemory = VK_NULL_HANDLE' in rh
 assert 'VkImage classicBridgeImage = VK_NULL_HANDLE' in rh
 assert rt.index('cib1Resource = gpu->createResource') < rt.index('VkMemoryRequirements memReqs;', rt.index('cib1Resource = gpu->createResource'))
 result_start = rt.index('    if (hostRes != VK_SUCCESS) return hostRes;')
