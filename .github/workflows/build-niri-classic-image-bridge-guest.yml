@@ -50,6 +50,8 @@ jobs:
           python3 -I patch-classic-image-bridge-guest.py "$MESA_SRC_DIR" | tee out/bridge-patch.txt
           python3 -I patch-cib1-reason-guest.py "$MESA_SRC_DIR" | tee out/cib1-reason-patch.txt
           python3 -I patch-create-diag-guest.py "$MESA_SRC_DIR" | tee out/create-diag-patch.txt
+          python3 -I patch-gbm-host3d-guest.py "$MESA_SRC_DIR" | tee out/gbm-host3d-patch.txt
+          grep -q 'gfxstreamGbmHost3d' "$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp"
           # patch-alloc-diag-guest.py is intentionally not applied: its anchor no longer
           # matches after the CIB1 edits ("expected one allocate anchor, found 0").
           git -C "$MESA_SRC_DIR" diff --check
@@ -114,7 +116,7 @@ jobs:
             cp /mesa/build-cross/meson-info/intro-buildoptions.json /out/meson-buildoptions.json
             cp /mesa/build-cross/meson-logs/meson-log.txt /out/meson-log.txt
           '
-          cp patch-guest-modifier.py patch-classic-image-bridge-guest.py check-classic-image-bridge-guest.py test-classic-image-bridge-guest.py patch-cib1-reason-guest.py patch-create-diag-guest.py patch-alloc-diag-guest.py patch-ring-wake-guest.py check-ring-wake-guest.py patch-ring-wake-diag-guest.py check-ring-wake-diag-guest.py .github/workflows/build-niri-classic-image-bridge-guest.yml out/
+          cp patch-guest-modifier.py patch-classic-image-bridge-guest.py check-classic-image-bridge-guest.py test-classic-image-bridge-guest.py patch-cib1-reason-guest.py patch-create-diag-guest.py patch-gbm-host3d-guest.py patch-alloc-diag-guest.py patch-ring-wake-guest.py check-ring-wake-guest.py patch-ring-wake-diag-guest.py check-ring-wake-diag-guest.py .github/workflows/build-niri-classic-image-bridge-guest.yml out/
           (cd out && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
