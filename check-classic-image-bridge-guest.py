@@ -70,12 +70,16 @@ for text in ['#include "vk_android_native_buffer_gfxstream.h"',
              '!cib1 && (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)',
              'memReqs.alignment != 1', 'flags == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT',
              'info.classicBridgeResource = std::move(cib1Resource)',
-             'pAllocateInfo->allocationSize != ci.baseRequirements.size',
+             'pAllocateInfo->allocationSize == ci.baseRequirements.size',
              'local.pNext = &dedicated', 'dedicated.pNext = &cb',
              'VkImportColorBufferGOOGLE cb',
              'vk_find_struct_const(pAllocateInfo, IMPORT_MEMORY_FD_INFO_KHR)',
-             'const bool cib1Backing =',
-             '(importFdInfo != nullptr)',
+             'const bool cib1Eligible =',
+             'ci.device == device && !ci.classicBridgeAllocated && !cib1Dedicated->buffer',
+             'pAllocateInfo->memoryTypeIndex < 32',
+             'CIB1-ALLOC-GUEST: image=%p bridge=1 dedicated=1',
+             'GFXSTREAM_CIB_ALLOC_DIAG',
+             'cib1Eligible ? "bridge" : "reject"',
              'cib1BindIdentity(ii.classicBridgeResource != nullptr',
              'cib1RetainAllocation(image != info_VkImage.end()',
              'mi.classicBridgeBound, memoryOffset)',
@@ -88,6 +92,10 @@ for text in ['#include "vk_android_native_buffer_gfxstream.h"',
              'maxMipLevels = 1', 'maxArrayLayers = 1', 'sampleCounts = VK_SAMPLE_COUNT_1_BIT',
              'if (!cib1Query) localImageFormatInfo.usage &=']:
     assert text in rt, text
+# The ColorBuffer import must not depend on the app's export/import metadata: a compositor
+# allocation that names neither VkExportMemoryAllocateInfo nor VkImportMemoryFdInfoKHR still
+# binds to the bridge-owned backing.
+assert 'cib1Backing' not in rt
 create_block = rt[rt.index('if (cib1) {'):rt.index('if (extImgCiPtr && !cib1)')]
 assert 'if (cib1ViewsInfo) {' in create_block
 assert 'else if (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)' in create_block
