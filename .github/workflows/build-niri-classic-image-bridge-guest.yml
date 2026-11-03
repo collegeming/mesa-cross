@@ -50,7 +50,8 @@ jobs:
           python3 -I patch-classic-image-bridge-guest.py "$MESA_SRC_DIR" | tee out/bridge-patch.txt
           python3 -I patch-cib1-reason-guest.py "$MESA_SRC_DIR" | tee out/cib1-reason-patch.txt
           python3 -I patch-create-diag-guest.py "$MESA_SRC_DIR" | tee out/create-diag-patch.txt
-          python3 -I patch-alloc-diag-guest.py "$MESA_SRC_DIR" | tee out/alloc-diag-patch.txt
+          # patch-alloc-diag-guest.py is intentionally not applied: its anchor no longer
+          # matches after the CIB1 edits ("expected one allocate anchor, found 0").
           git -C "$MESA_SRC_DIR" diff --check
           git -C "$MESA_SRC_DIR" diff --binary > out/classic-image-bridge-complete.patch
           git -C "$MESA_SRC_DIR" diff --name-only > out/changed-source-files.txt
