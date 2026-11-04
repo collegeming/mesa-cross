@@ -12,7 +12,7 @@ Checks:
   3. the covered line range always contains every byte of the mapping for every legal line
      size and an unaligned base (the arithmetic is modelled and compared to the source);
   4. the driver still has no mapped-range hook, so nothing else is assumed to do this work;
-  5. the file is brace-balanced.
+  5. the inserted block is brace-balanced.
 """
 import pathlib
 import sys
@@ -83,8 +83,9 @@ assert 'on_vkInvalidateMappedMemoryRanges' not in source_clean
 unmap = source_clean.index('void ResourceTracker::on_vkUnmapMemory')
 assert '// no-op' in source_clean[unmap:unmap + 160]
 
-# 5. balanced braces.
-assert source_clean.count('{') == source_clean.count('}'), 'unbalanced braces'
+# 5. the inserted block itself is balanced. A file-wide count is not usable: the earlier
+#    patches in this chain legitimately carry braces inside log-format strings.
+assert block.count('{') == block.count('}'), 'inserted flush block is unbalanced'
 
 report = (
     'PASS one flush block, ahead of the single queue submission encode\n'
@@ -93,7 +94,7 @@ report = (
     'PASS line range covers every byte for DminLine 64..512, sizes 1..3686400, unaligned base\n'
     'PASS portable fallback present; GFXSTREAM_HOSTVISIBLE_FLUSH opt-out present\n'
     'PASS driver still has no mapped-range hook; on_vkUnmapMemory still a no-op\n'
-    'PASS source is brace-balanced\n'
+    'PASS inserted block is brace-balanced\n'
 )
 print(report, end='')
 if out:

@@ -153,8 +153,15 @@ if patched.count('GFXSTREAM_HOSTVISIBLE_FLUSH') != 1:
 if patched.count('__builtin___clear_cache(reinterpret_cast<char*>(memoryInfo.ptr),') != 1:
     raise SystemExit('portable fallback missing')
 
-if patched.count('{') != patched.count('}'):
-    raise SystemExit('brace count changed; the inserted block is unbalanced')
+# Balance only the block this script inserts: the rest of the file legitimately carries braces
+# inside log-format strings after the earlier patches, so a file-wide count proves nothing.
+inserted = patched[patched.index('HOSTVISIBLE-FLUSH') - 12:patched.index(
+    '// The main queue submission')]
+open_braces = inserted.count('{')
+close_braces = inserted.count('}')
+if open_braces != close_braces:
+    raise SystemExit(f'inserted flush block is unbalanced ({open_braces} open, '
+                     f'{close_braces} close)')
 
 if args.diff:
     args.diff.write_text(
