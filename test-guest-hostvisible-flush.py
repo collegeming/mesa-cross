@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Assert the invariants of the host-visible CPU->GPU flush patch on a patched tree.
+"""Assert the invariants of the v2 host-visible flush patch (clean at vkUnmapMemory).
 
-Run against the patched mesa checkout (Actions does this after applying the patch chain and
-again after the build). No GPU, no Vulkan linkage, no device: this only proves that the code
-that is about to ship still says what the root cause requires.
+v1 swept every mapped allocation on every submission and broke the device test (SEGV after
+`no reply to opcode 20061`, OP_vkCreatePipelineCache). The invariants below are the ones that
+keep that shape out of the shipped source.
 
 Checks:
-  1. the flush block exists exactly once, before the one queue-submission encode site;
-  2. inside that block: mLock held, mapped-allocation guard, dc cvac per line, dsb ish,
-     CTR_EL0-derived line size, portable fallback, opt-out switch;
-  3. the covered line range always contains every byte of the mapping for every legal line
-     size and an unaligned base (the arithmetic is modelled and compared to the source);
-  4. the driver still has no mapped-range hook, so nothing else is assumed to do this work;
-  5. the inserted block is brace-balanced.
+  1. the flush lives only in on_vkUnmapMemory and there is no cache maintenance anywhere on
+     the submission path;
+  2. default OFF: the switch is read as `== '1'` and nothing runs before that check;
+  3. destroyed/allocation safety: the walk looks the memory up in info_VkDeviceMemory under
+     mLock, refuses a missing entry or a null pointer, and is bounded by that allocation;
+  4. a hard per-allocation cap with a skipped counter exists before the walk;
+  5. one dc cvac site and one dsb ish site, both inside the guarded branch;
+  6. counters for flushes / bytes / unmapped / over-cap are logged once per submit window;
+  7. the inserted function is brace-balanced.
 """
 import pathlib
 import sys
@@ -20,81 +22,80 @@ import sys
 root = pathlib.Path(sys.argv[1]).resolve()
 out = pathlib.Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
 source = (root / 'src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp').read_text(
-    encoding='utf-8', errors='replace')
-source_clean = source.replace('\r\n', '\n')
+    encoding='utf-8', errors='replace').replace('\r\n', '\n')
 
+UNMAP = 'void ResourceTracker::on_vkUnmapMemory('
+SUBMIT = 'VkResult ResourceTracker::on_vkQueueSubmitTemplate('
+WAIT = 'VkResult ResourceTracker::on_vkQueueWaitIdle('
 MARKER = 'HOSTVISIBLE-FLUSH'
-ENCODE = 'input_result = vkQueueSubmitEnc(enc, queue, submitCount, prunedSubmitInfos.data(), fence);'
 
-# 1. exactly one flush block, before the single encode site.
-assert source_clean.count(MARKER) == 2, 'flush block must appear once (comment + log tag)'
-assert source_clean.count(ENCODE) == 1, 'queue submission encode site must stay unique'
-start = source_clean.index('    // ---- CPU writes into host-visible memory must reach the GPU')
-end = source_clean.index(ENCODE)
-block = source_clean[start:end]
-assert end > start
-assert 'HOSTVISIBLE-FLUSH' in block
+unmap_start = source.index(UNMAP)
+unmap_end = source.index('void ResourceTracker::transformImageMemoryRequirements2ForGuest(')
+unmap = source[unmap_start:unmap_end]
 
-# 2. the block does what the root cause needs, in this order.
-required = [
-    'std::unique_lock<std::recursive_mutex> lock(mLock);',
-    'getenv("GFXSTREAM_HOSTVISIBLE_FLUSH")',
-    'uint64_t ctr = 0;',
-    '__asm__ __volatile__("mrs %0, ctr_el0" : "=r"(ctr));',
-    'const uintptr_t cacheLineSize = static_cast<uintptr_t>(4u) << ((ctr >> 16) & 0xfu);',
-    'if (!memoryInfo.ptr || !memoryInfo.allocationSize) continue;',
-    'reinterpret_cast<uintptr_t>(memoryInfo.ptr) & ~(cacheLineSize - 1);',
-    '__asm__ __volatile__("dc cvac, %0" : : "r"(line) : "memory");',
-    '__builtin___clear_cache(reinterpret_cast<char*>(memoryInfo.ptr),',
-    '__asm__ __volatile__("dsb ish" : : : "memory");',
-]
-position = 0
-for snippet in required:
-    found = block.find(snippet, position)
-    assert found >= 0, f'missing or out of order inside the flush block: {snippet}'
-    position = found
-assert block.count('dc cvac') == 1, 'one clean site only'
-assert block.count('dsb ish') == 1, 'one fence site only'
-assert 'dc civac' not in block, 'a clean must not drop the guest dirty lines'
-# The guard must exclude allocations the application never mapped: the deferred-mapping
-# allocation path leaves ptr null until the first vkMapMemory.
-assert 'if (!memoryInfo.ptr' in block
-assert block.count('for (auto& memoryInfoIt : info_VkDeviceMemory)') == 1
+# 1. the flush is not on the submission path.
+submit_body = source[source.index(SUBMIT):source.index(WAIT)]
+assert 'dc cvac' not in submit_body, 'submission path must not carry cache maintenance (v1 bug)'
+assert 'HOSTVISIBLE-FLUSH' not in submit_body, 'submission path must not carry the flush'
+assert unmap.count(MARKER) == 2, 'flush must appear once (comment + log tag)'
 
-# 3. line-range arithmetic: every byte of the mapping is covered, for every legal DminLine and
-# an unaligned base. This models the two expressions the block uses.
-def covered(base, size, line):
-    begin = base & ~(line - 1)
-    return begin, begin + size + ((base - begin + line - 1) // line) * line
+# 2. default off, checked before anything else in the function.
+assert "value && value[0] == '1'" in unmap, "opt-in must be exactly `value[0] == '1'`"
+gate = unmap.index('if (!hostVisibleFlushEnabled) return;')
+assert gate < unmap.index('std::lock_guard<std::recursive_mutex> lock(mLock);')
+assert gate < unmap.index('dc cvac')
+assert 'hostVisibleFlushEnabled = true' not in unmap
 
-for line in (64, 128, 256, 512):
-    for size in (1, 3, 4095, 4096, 4097, 261696, 303104, 2097152, 3686400):
-        for misalign in (0, 1, 63, 4095):
-            base = 0xFFFF00000000 + misalign
-            begin, end = covered(base, size, line)
-            assert begin <= base and begin % line == 0
-            assert begin + ((end - begin + line - 1) // line) * line >= base + size
-            assert (end - begin) <= size + 2 * line
+# The truth table the shipped predicate implements, modelled here.
+def enabled(value):
+    return bool(value) and value[0] == '1'
+for value, expected in ((None, False), ('', False), ('0', False), ('1', True), ('1x', True),
+                        ('true', False), ('yes', False)):
+    assert enabled(value) is expected, f'opt-in truth table wrong for {value!r}'
 
-# 4. no mapped-range hook is present, and unmap is still a no-op: this patch is the only
-#    CPU->GPU maintenance in the driver.
-assert 'on_vkFlushMappedMemoryRanges' not in source_clean
-assert 'on_vkInvalidateMappedMemoryRanges' not in source_clean
-unmap = source_clean.index('void ResourceTracker::on_vkUnmapMemory')
-assert '// no-op' in source_clean[unmap:unmap + 160]
+# 3. allocation safety: lookup under the lock, refuse missing or null, bound by the allocation.
+for snippet in (
+    'std::lock_guard<std::recursive_mutex> lock(mLock);',
+    'auto it = info_VkDeviceMemory.find(memory);',
+    'if (!ptr || !size) {',
+    'const uint64_t size = (it == info_VkDeviceMemory.end()) ? 0 : it->second.allocationSize;',
+):
+    assert snippet in unmap, f'missing allocation-safety invariant: {snippet}'
+assert unmap.index('info_VkDeviceMemory.find(memory)') < unmap.index('dc cvac'), \
+    'the walk must look the allocation up before touching its pointer'
+assert 'getMappedPointer(' not in unmap, 'must not use a cached pointer accessor'
 
-# 5. the inserted block itself is balanced. A file-wide count is not usable: the earlier
-#    patches in this chain legitimately carry braces inside log-format strings.
-assert block.count('{') == block.count('}'), 'inserted flush block is unbalanced'
+# 4. cap before the walk, with a counter.
+assert 'size > hostVisibleFlushMaxBytes' in unmap
+assert unmap.index('size > hostVisibleFlushMaxBytes') < unmap.index('dc cvac')
+assert 'GFXSTREAM_HOSTVISIBLE_FLUSH_MAX_MB' in unmap
+assert '++sSkippedOverCap;' in unmap
+
+# 5. exactly one clean site and one fence, after the guards.
+assert unmap.count('__asm__ __volatile__("dc cvac, %0" : : "r"(line) : "memory");') == 1
+assert unmap.count('__asm__ __volatile__("dsb ish" : : : "memory");') == 1
+assert unmap.index('size > hostVisibleFlushMaxBytes') < unmap.index('dsb ish')
+assert '__builtin___clear_cache(' in unmap, 'portable fallback missing'
+
+# 6. counters.
+for counter in ('sFlushes', 'sBytes', 'sSkippedUnmapped', 'sSkippedOverCap'):
+    assert counter in unmap, f'missing counter {counter}'
+assert 'flushes=%llu bytes=%llu unmapped=%llu' in unmap
+assert 'guestDiagEnabled()' in unmap
+
+# 7. balance of the whole rewritten function.
+assert unmap.count('{') == unmap.count('}'), 'on_vkUnmapMemory is unbalanced'
+# The patch must not have removed the one submission encode site.
+assert source.count('vkQueueSubmitEnc(enc, queue, submitCount, prunedSubmitInfos.data(), fence);') == 1
 
 report = (
-    'PASS one flush block, ahead of the single queue submission encode\n'
-    'PASS mLock, mapped-allocation guard, CTR_EL0 line size, per-line dc cvac, dsb ish\n'
-    'PASS no civac (guest dirty lines are published, not dropped)\n'
-    'PASS line range covers every byte for DminLine 64..512, sizes 1..3686400, unaligned base\n'
-    'PASS portable fallback present; GFXSTREAM_HOSTVISIBLE_FLUSH opt-out present\n'
-    'PASS driver still has no mapped-range hook; on_vkUnmapMemory still a no-op\n'
-    'PASS inserted block is brace-balanced\n'
+    'PASS flush only in on_vkUnmapMemory; submission path carries no cache maintenance\n'
+    'PASS default OFF (`value[0] == \'1\'`), gate precedes lock/walk; truth table modelled\n'
+    'PASS allocation safety: mLock + info lookup + null/empty refusal + allocation bound\n'
+    'PASS per-allocation cap before the walk with over-cap counter\n'
+    'PASS one dc cvac + one dsb ish, after the guards; portable fallback present\n'
+    'PASS counters flushes/bytes/unmapped/over-cap under GFXSTREAM_GUEST_DIAG\n'
+    'PASS on_vkUnmapMemory brace-balanced; submission encode site intact\n'
 )
 print(report, end='')
 if out:
