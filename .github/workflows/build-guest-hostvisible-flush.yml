@@ -1,0 +1,125 @@
+name: guest host-visible submit flush (artifact only)
+on:
+  push:
+    branches: [diagnostic/guest-hostvisible-flush]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: guest-hostvisible-flush-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  MESA_COMMIT: cecc0e96d7193c72356a31abb0cc589e4fc0415e
+  MESA_TREE: b004f763691a8f7a66e9b927cc3b5ffc33cb6e68
+  MESA_URL: https://github.com/Droid-VM/mesa.git
+  MESA_SRC_DIR: ${{ github.workspace }}/mesa
+jobs:
+  build:
+    if: github.repository == 'collegeming/mesa-cross' && (github.ref == 'refs/heads/diagnostic/guest-hostvisible-flush' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Fetch exact source and verify the reference build recipe
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init "$MESA_SRC_DIR"
+          git -C "$MESA_SRC_DIR" remote add origin "$MESA_URL"
+          git -C "$MESA_SRC_DIR" fetch --filter=blob:none origin "$MESA_COMMIT"
+          git -C "$MESA_SRC_DIR" checkout --detach FETCH_HEAD
+          test "$(git -C "$MESA_SRC_DIR" rev-parse HEAD)" = "$MESA_COMMIT"
+          test "$(git -C "$MESA_SRC_DIR" rev-parse 'HEAD^{tree}')" = "$MESA_TREE"
+          test "$(git -C "$MESA_SRC_DIR" rev-parse --is-shallow-repository)" = false
+          grep -Eq '^#define VK_HEADER_VERSION +358$' "$MESA_SRC_DIR/include/vulkan/vulkan_core.h"
+          git -C "$MESA_SRC_DIR" diff --exit-code HEAD --
+          mkdir out
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ binutils python3
+          sha256sum Dockerfile.mesa-cross build.sh build-in-container.sh ci-build.sh mesa-config.sh package.sh aarch64-linux-gnu.meson aarch64-llvm-config ubuntu.sources > out/recipe-files.sha256
+          printf '%s  %s\n' a8bf4c14c20bf98c0d0c95fe8c7ab6cabce2eff6f1499a302dc67832a4cce1a7 "$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp" | sha256sum -c -
+      - name: Apply the existing patch chain, then the host-visible submit flush patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp"
+          python3 -I patch-guest-modifier.py "$src" --diff out/guest-modifier.patch | tee out/modifier-checks.txt
+          printf '%s  %s\n' bf97e6cc9a96ee072b29a550d611e13ca7c58cf33ddaa49ad3a538ff91bda365 "$src" | sha256sum -c -
+          python3 -I patch-classic-image-bridge-guest.py "$MESA_SRC_DIR" | tee out/bridge-patch.txt
+          python3 -I patch-cib1-reason-guest.py "$MESA_SRC_DIR" | tee out/cib1-reason-patch.txt
+          python3 -I patch-create-diag-guest.py "$MESA_SRC_DIR" | tee out/create-diag-patch.txt
+          python3 -I patch-gbm-host3d-guest.py "$MESA_SRC_DIR" | tee out/gbm-host3d-patch.txt
+          python3 -I patch-guest-dedicated-hostvisible.py "$MESA_SRC_DIR" --diff out/guest-dedicated-hostvisible.patch | tee out/dedicated-hostvisible-patch.txt
+          python3 -I patch-ring-wake-guest.py "$MESA_SRC_DIR" | tee out/ring-wake-patch.txt
+          python3 -I patch-ring-wake-diag-guest.py "$MESA_SRC_DIR" | tee out/ring-wake-diag-patch.txt
+          # The one change under test.
+          python3 -I patch-guest-hostvisible-flush.py "$MESA_SRC_DIR" --diff out/guest-hostvisible-flush.patch | tee out/hostvisible-flush-patch.txt
+          grep -q 'HOSTVISIBLE-FLUSH' "$src"
+          grep -q 'dc cvac' "$src"
+          grep -q 'GFXSTREAM_HOSTVISIBLE_FLUSH' "$src"
+          python3 -I test-guest-hostvisible-flush.py "$MESA_SRC_DIR" "$PWD/out" | tee out/hostvisible-flush-source-checks.txt
+          python3 -I check-ring-wake-guest.py "$MESA_SRC_DIR" | tee out/ring-wake-checks.txt
+          python3 -I check-ring-wake-diag-guest.py "$MESA_SRC_DIR" | tee out/ring-wake-diag-checks.txt
+          python3 -I check-classic-image-bridge-guest.py "$MESA_SRC_DIR" | tee out/bridge-source-checks.txt
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 python3 -I test-classic-image-bridge-guest.py "$MESA_SRC_DIR" "$PWD/out" | tee out/bridge-helper-tests.txt
+          git -C "$MESA_SRC_DIR" diff --check
+          git -C "$MESA_SRC_DIR" diff --binary > out/all-source-changes-complete.patch
+          git -C "$MESA_SRC_DIR" diff --name-only > out/all-changed-source-files.txt
+          (cd "$MESA_SRC_DIR" && sha256sum src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp src/gfxstream/guest/vulkan_enc/ResourceTracker.h) > out/patched-sources.sha256
+      - uses: docker/setup-buildx-action@v3
+      - name: Cross environment
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.mesa-cross
+          tags: droidvm-mesa-cross:latest
+          load: true
+          cache-from: type=gha,scope=mesa-cross-env
+          cache-to: type=gha,mode=max,scope=mesa-cross-env,ignore-error=true
+      - name: Cross-compile the guest ICD
+        env:
+          MESA_NO_IMAGE_BUILD: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./ci-build.sh droidvm "$PWD/out"
+          (cd "$MESA_SRC_DIR" && sha256sum -c "$GITHUB_WORKSPACE/out/patched-sources.sha256")
+          sha256sum -c out/recipe-files.sha256
+          python3 -I test-guest-hostvisible-flush.py "$MESA_SRC_DIR" "$PWD/out" | tee out/hostvisible-flush-source-checks-after-build.txt
+          grep -Fx "MESA_COMMIT=$MESA_COMMIT" out/build.env
+      - name: Inspect the binary and record provenance (no guest execution)
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf 'RUN_URL=%s/%s/actions/runs/%s\nRECIPE_SHA=%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_SHA"
+            printf 'MESA_COMMIT=%s\nMESA_TREE=%s\nVULKAN_HEADERS=1.4.358\n' "$MESA_COMMIT" "$MESA_TREE"
+            printf 'CHANGE=guest ICD cleans every application-mapped host-visible allocation (dc cvac) immediately before the queue submission that may read it, then dsb ish\n'
+            printf 'WHY=host imports these pages as VK_EXT_external_memory_host on a cached non-coherent Mali type and advertises MAP_CACHE_CACHED, so the guest mapping is write-back; no side performed CPU->GPU maintenance (guest has no mapped-range hook, host pre-submit writeback is opt-in), so the GPU read DRAM\n'
+            printf 'COST=one cache-line walk over the currently mapped host-visible allocations per submit; GFXSTREAM_HOSTVISIBLE_FLUSH=0 disables, GFXSTREAM_GUEST_DIAG=1 logs the first 8 submits\n'
+            printf 'EXECUTION=Actions compile/source checks only; no guest GPU execution; device acceptance by the deploy owner\n'
+            docker image inspect droidvm-mesa-cross:latest --format 'DOCKER_IMAGE_ID={{.Id}}'
+            sha256sum patch-guest-modifier.py patch-classic-image-bridge-guest.py check-classic-image-bridge-guest.py test-classic-image-bridge-guest.py patch-cib1-reason-guest.py patch-create-diag-guest.py patch-gbm-host3d-guest.py patch-guest-dedicated-hostvisible.py patch-ring-wake-guest.py check-ring-wake-guest.py patch-ring-wake-diag-guest.py check-ring-wake-diag-guest.py patch-guest-hostvisible-flush.py test-guest-hostvisible-flush.py
+          } > out/provenance.txt
+          docker run --rm -v "$PWD/out:/out" -v "$MESA_SRC_DIR:/mesa:ro" droidvm-mesa-cross:latest bash -euo pipefail -c '
+            dpkg-query -W > /out/build-packages.txt
+            dpkg-deb -f /out/*.deb > /out/debian-control.txt
+            root=$(mktemp -d)
+            dpkg-deb -x /out/*.deb "$root"
+            so="$root/usr/local/lib/aarch64-linux-gnu/libvulkan_gfxstream.so"
+            test -f "$so"
+            aarch64-linux-gnu-readelf -h -d -V "$so" > /out/elf-dependencies.txt
+            sha256sum "$so" | sed "s|$root/||" > /out/icd.sha256
+            cp /mesa/build-cross/meson-info/intro-buildoptions.json /out/meson-buildoptions.json 2>/dev/null || true
+            cp /mesa/build-cross/meson-logs/meson-log.txt /out/meson-log.txt 2>/dev/null || true
+          '
+          cp patch-guest-modifier.py patch-classic-image-bridge-guest.py check-classic-image-bridge-guest.py test-classic-image-bridge-guest.py patch-cib1-reason-guest.py patch-create-diag-guest.py patch-gbm-host3d-guest.py patch-guest-dedicated-hostvisible.py patch-ring-wake-guest.py check-ring-wake-guest.py patch-ring-wake-diag-guest.py check-ring-wake-diag-guest.py patch-guest-hostvisible-flush.py test-guest-hostvisible-flush.py .github/workflows/build-guest-hostvisible-flush.yml out/
+          (cd out && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: guest-hostvisible-flush
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
