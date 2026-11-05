@@ -52,7 +52,8 @@ jobs:
       # invalidates declared-coherent mappings after vkWaitSemaphores/
       # vkWaitForFences/vkQueueWaitIdle; CMap invalidates the range a vkMapMemory
       # is about to return; CUnmap cleans the range a vkUnmapMemory releases. All
-      # are behind GFXSTREAM_GUEST_INVALIDATE and off by default.
+      # four run by default; GFXSTREAM_GUEST_INVALIDATE=0/off restores the
+      # pre-patch behaviour, and GFXSTREAM_GUEST_INVALIDATE_STATS=1 adds counters.
       - name: Apply guest readback-invalidate patch (A1+A2+CMap+CUnmap) and assert boundaries
         shell: bash
         run: |
@@ -67,7 +68,7 @@ jobs:
             --diff out/guest-readback-invalidate.patch | tee out/patch-static-checks.txt
           # Host-compiled unit test of the real header: the switch and the range
           # math are pure logic; the aarch64 cache instructions are stubs on x86.
-          g++ -std=c++17 -Wall -Wextra -Werror \
+          g++ -std=c++17 -Wall -Wextra -Werror -pthread \
             -I "$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc" \
             ./test-guest-cache-maintenance.cpp -o out/test-guest-cache-maintenance
           out/test-guest-cache-maintenance | tee out/unit-tests.txt
@@ -127,8 +128,9 @@ jobs:
             printf 'RUN_URL=%s\nRECIPE_REPOSITORY=%s\nRECIPE_REF=%s\nRECIPE_SHA=%s\n' "$RUN_URL" "$GITHUB_REPOSITORY" "$GITHUB_REF" "$RECIPE_SHA"
             printf 'MESA_URL=%s\nVULKAN_HEADERS=1.4.358\nRELEASE=false\n' "$MESA_URL"
             printf 'MESA_TREE=%s\n' "$(git -C "$MESA_SRC_DIR" rev-parse 'HEAD^{tree}')"
-            printf 'MESA_PATCH=guest-readback-invalidate-a1-a2-cmap-cunmap-v2\nMESA_WORKTREE_DIRTY=true\n'
-            printf 'GFXSTREAM_GUEST_INVALIDATE=off_by_default; modes=1|a1|a2|cmap|cunmap|comma-list\n'
+            printf 'MESA_PATCH=guest-readback-invalidate-a1-a2-cmap-cunmap-default-on-stats-v3\nMESA_WORKTREE_DIRTY=true\n'
+            printf 'GFXSTREAM_GUEST_INVALIDATE=on_by_default; =0|off disables; modes=1|on|all|a1|a2|cmap|cunmap|comma-list\n'
+            printf 'GFXSTREAM_GUEST_INVALIDATE_STATS=opt_in; GUEST-CMO-STATS line at exit or SIGUSR1\n'
             sha256sum patch-guest-readback-invalidate.py check-guest-readback-invalidate.py test-guest-cache-maintenance.cpp out/guest-readback-invalidate.patch out/patched-sources.sha256
             docker image inspect droidvm-mesa-cross:latest --format 'DOCKER_IMAGE_ID={{.Id}}'
             sha256sum Dockerfile.mesa-cross build.sh build-in-container.sh ci-build.sh mesa-config.sh package.sh aarch64-linux-gnu.meson aarch64-llvm-config ubuntu.sources

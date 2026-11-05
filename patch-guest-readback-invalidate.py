@@ -9,7 +9,7 @@ old contents. zink trusts the coherent flag and never calls
 vkInvalidateMappedMemoryRanges, so a screenshot staging buffer keeps 64 B lines
 of stale zeros (16 px * 4 B = one cache line).
 
-Four mechanisms, all behind GFXSTREAM_GUEST_INVALIDATE:
+Four mechanisms, all ON by default:
 
   A1     vkFlushMappedMemoryRanges / vkInvalidateMappedMemoryRanges really
          clean / clean+invalidate the requested range instead of only
@@ -37,13 +37,25 @@ userspace ICD: the virtio-gpu blob mapping is a plain GEM mmap, not a dma-buf,
 so DMA_BUF_IOCTL_SYNC is not applicable, and msync does no cache maintenance.
 Linux enables SCTLR_EL1.UCI for EL0 (the AArch64 ABI needs it for
 __clear_cache), and the guest native CMO probe completed
-"dsb sy; dc civac; dsb sy" with signal=0 on this kernel.
+"dsb sy; dc civac; dsb sy" with signal=0 on this kernel. Userspace cannot read
+UCI and /proc/cpuinfo has no field for it, so the header executes one dc civac
+on a stack line behind a SIGILL handler at first use: a kernel without UCI is
+detected and every mechanism is disabled instead of taking SIGILL.
 
-GFXSTREAM_GUEST_INVALIDATE accepts "1"/"on"/"all" for everything, or a
-comma-separated list of a1, a2, cmap, cunmap for device-side splitting.
-Default behaviour is unchanged: with the variable unset, empty, "0" or "off"
-every entry point returns before touching any state, and no log line is added
-anywhere.
+GFXSTREAM_GUEST_INVALIDATE:
+  unset / empty        everything on (the default)
+  "0" / "off"          everything off, exactly the pre-patch behaviour
+  "1" / "on" / "all"   everything on
+  comma list of a1, a2, cmap, cunmap  per-mechanism split for device runs
+
+Diagnostics, both off unless set:
+  GFXSTREAM_GUEST_INVALIDATE_STATS=1  count maps/unmaps/waits, maintained bytes
+      and nanoseconds, and print one "GUEST-CMO-STATS ..." line to stderr at
+      exit or on SIGUSR1.
+  GFXSTREAM_GUEST_INVALIDATE_DEBUG=1  print the resolved configuration once.
+
+The environment is read on first use under a statically initialized mutex; no
+static initializer decides the mode.
 
 Patched files (pinned to cecc0e96):
   src/gfxstream/guest/vulkan_enc/GuestCacheMaintenance.h        (new)
@@ -72,6 +84,8 @@ BASE_SHA256 = {
 }
 MARKER = 'guestCacheMaintenance'
 ENV_NAME = 'GFXSTREAM_GUEST_INVALIDATE'
+STATS_ENV_NAME = 'GFXSTREAM_GUEST_INVALIDATE_STATS'
+DEBUG_ENV_NAME = 'GFXSTREAM_GUEST_INVALIDATE_DEBUG'
 
 HEADER = r'''/*
  * Copyright 2026 DroidVM
@@ -94,11 +108,38 @@ HEADER = r'''/*
 // A2: after a GPU completion wait, clean+invalidate every mapped allocation
 //     declared HOST_VISIBLE|HOST_COHERENT, because a caller that trusts the
 //     coherent flag (zink does) never calls invalidate itself.
+// CMAP: clean+invalidate the range a vkMapMemory is about to hand to the CPU.
+// CUNMAP: clean the range a vkUnmapMemory releases, so CPU writes still dirty
+//     in cache reach the GPU that samples the buffer next.
 //
-// Everything is enabled by GFXSTREAM_GUEST_INVALIDATE. With the variable unset,
-// empty, "0" or "off" the callers return before touching any state.
+// The four mechanisms are ON by default. The "coherent" memory this ICD
+// advertises is not coherent with the guest CPU, so the pre-patch behaviour is
+// a wrong image, not a cheap one. GFXSTREAM_GUEST_INVALIDATE=0 (or "off")
+// restores that baseline exactly; "1"/"on"/"all" and a comma-separated list of
+// a1, a2, cmap, cunmap keep the per-mechanism split for device-side runs.
+//
+// Diagnostics, off unless set:
+//   GFXSTREAM_GUEST_INVALIDATE_STATS=1  count maps/unmaps/waits, maintained
+//       bytes and nanoseconds, print one "GUEST-CMO-STATS ..." line to stderr
+//       at process exit or on SIGUSR1.
+//   GFXSTREAM_GUEST_INVALIDATE_DEBUG=1  print the resolved configuration once.
+//
+// Nothing here runs a static initializer: the environment is read on first use,
+// under a statically initialized mutex, and the result is cached in one atomic
+// word.
 
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <unistd.h>
+#endif
 
 namespace gfxstream {
 namespace vk {
@@ -115,14 +156,43 @@ enum GuestCacheMode : uint32_t {
     kGuestCacheModeCUnmap = 1u << 3,  // clean the mapped range at vkUnmapMemory
     kGuestCacheModeAll = kGuestCacheModeA1 | kGuestCacheModeA2 | kGuestCacheModeCMap |
                          kGuestCacheModeCUnmap,
+    // Not a maintenance mode: enables the counters behind
+    // GFXSTREAM_GUEST_INVALIDATE_STATS=1. It shares the word with the mode so
+    // an entry point finds both with a single load.
+    kGuestCacheModeStats = 1u << 31,
 };
 
-// Parsed once, by a caller-side function-local static (never a static
-// initializer). "1"/"on"/"all" select everything; otherwise the value is a
-// comma-separated list of a1, a2, cmap and cunmap. Unknown tokens select
-// everything, so a typo widens the diagnostic instead of disabling the fix.
-static inline uint32_t guestCacheModeFromEnvValue(const char* value) {
-    if (!value || !value[0]) return kGuestCacheModeOff;
+// Statistic buckets. The value travels through the mapped-allocation helper as
+// uint32_t so ResourceTracker.h does not have to include this header.
+enum GuestCacheStatEvent : uint32_t {
+    kGuestCacheStatNone = 0,
+    kGuestCacheStatMap = 1,
+    kGuestCacheStatUnmap = 2,
+    kGuestCacheStatWait = 3,
+};
+
+// Sentinels for the one-time parse. Parsed words only use bits 0..3 and 31, so
+// neither value can collide with a real configuration.
+static constexpr uint32_t kGuestCacheConfigUnparsed = 0xFFFFFFFFu;
+
+// "1", "on" and "true" enable a diagnostic; unset, empty, "0" and "off" do not.
+static constexpr bool guestCacheEnvFlag(const char* value) {
+    if (!value) return false;
+    if (value[0] == '1' && !value[1]) return true;
+    if (value[0] == 'o' && value[1] == 'n' && !value[2]) return true;
+    if (value[0] == 't' && value[1] == 'r' && value[2] == 'u' && value[3] == 'e' && !value[4])
+        return true;
+    return false;
+}
+
+// Unset (or set but empty) selects everything: the coherent flag the host
+// reports is not real coherence on this mapping, so the correct behaviour is
+// the default. "0"/"off" restore the pre-patch baseline; "1"/"on"/"all" and a
+// comma-separated list of a1, a2, cmap, cunmap keep the split used for
+// device-side attribution. Unknown tokens select everything, so a typo widens
+// the fix instead of silently disabling it.
+static constexpr uint32_t guestCacheModeFromEnvValue(const char* value) {
+    if (!value || !value[0]) return kGuestCacheModeAll;
     if (value[0] == '0' && !value[1]) return kGuestCacheModeOff;
     if (value[0] == 'o' && value[1] == 'f' && value[2] == 'f' && !value[3])
         return kGuestCacheModeOff;
@@ -159,6 +229,25 @@ static inline uint32_t guestCacheModeFromEnvValue(const char* value) {
     return mode ? mode : kGuestCacheModeAll;
 }
 
+struct GuestCacheConfig {
+    uint32_t mode;  // maintenance bits, plus kGuestCacheModeStats when enabled
+    bool stats;
+    bool debug;
+};
+
+// Pure: no environment access, no probe, no logging. guestCacheResolveConfig()
+// feeds it the real values; the host unit test drives it directly.
+static inline GuestCacheConfig guestCacheConfigFromEnvValues(const char* modeValue,
+                                                             const char* statsValue,
+                                                             const char* debugValue) {
+    GuestCacheConfig config = {};
+    config.debug = guestCacheEnvFlag(debugValue);
+    config.stats = guestCacheEnvFlag(statsValue);
+    config.mode = guestCacheModeFromEnvValue(modeValue);
+    if (config.stats) config.mode |= kGuestCacheModeStats;
+    return config;
+}
+
 struct GuestCacheRange {
     uint64_t begin;  // byte offset into the allocation
     uint64_t end;    // exclusive
@@ -169,8 +258,8 @@ struct GuestCacheRange {
 // empty or does not intersect the allocation. The subtraction form cannot
 // overflow: allocationSize - offset is evaluated only after offset has been
 // checked against allocationSize.
-static inline GuestCacheRange guestCacheRangeForMappedMemory(uint64_t allocationSize,
-                                                             uint64_t offset, uint64_t size) {
+static constexpr GuestCacheRange guestCacheRangeForMappedMemory(uint64_t allocationSize,
+                                                                uint64_t offset, uint64_t size) {
     if (!allocationSize || offset >= allocationSize) return GuestCacheRange{0, 0};
     const uint64_t end = (size == UINT64_MAX || size > allocationSize - offset)
                              ? allocationSize
@@ -206,6 +295,232 @@ static inline void guestCacheCleanLine(void*) {}
 static inline void guestCacheSync() {}
 #endif
 
+// ------------------------------------------------------------------ counters
+//
+// Everything below only runs on the diagnostic side of
+// `if (guestCacheStats)`: the normal path costs one relaxed load (the mode).
+// The counters are atomics because map/unmap/waits arrive from several threads
+// once stats are enabled.
+
+struct GuestCacheCounters {
+    std::atomic<uint64_t> maps{0};
+    std::atomic<uint64_t> unmaps{0};
+    std::atomic<uint64_t> waits{0};
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> ns{0};
+};
+
+static inline GuestCacheCounters& guestCacheCounters() {
+    // Constant-initialized (std::atomic's constructor is constexpr), so no
+    // static-constructor ordering, and trivially destructible, so the atexit
+    // dump can still read it after main returns.
+    static GuestCacheCounters counters;
+    return counters;
+}
+
+// Monotonic nanoseconds. Only called when stats are enabled: clock_gettime is a
+// few tens of nanoseconds and has no place on the normal path.
+static inline uint64_t guestCacheNowNs() {
+#if defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+           static_cast<uint64_t>(ts.tv_nsec);
+#else
+    return 0;
+#endif
+}
+
+static inline char* guestCacheAppendText(char* out, const char* text) {
+    while (*text) *out++ = *text++;
+    return out;
+}
+
+static inline char* guestCacheAppendU64(char* out, uint64_t value) {
+    char digits[20];
+    int count = 0;
+    do {
+        digits[count++] = static_cast<char>('0' + static_cast<int>(value % 10));
+        value /= 10;
+    } while (value);
+    while (count) *out++ = digits[--count];
+    return out;
+}
+
+// One line, fixed prefix, fixed field order. Written with write(2) and no
+// stdio so the SIGUSR1 handler may call it (async-signal-safe).
+static inline void guestCacheStatsPrint() {
+    const GuestCacheCounters& counters = guestCacheCounters();
+    char buffer[192];
+    char* out = buffer;
+    out = guestCacheAppendText(out, "GUEST-CMO-STATS maps=");
+    out = guestCacheAppendU64(out, counters.maps.load(std::memory_order_relaxed));
+    out = guestCacheAppendText(out, " unmap=");
+    out = guestCacheAppendU64(out, counters.unmaps.load(std::memory_order_relaxed));
+    out = guestCacheAppendText(out, " waits=");
+    out = guestCacheAppendU64(out, counters.waits.load(std::memory_order_relaxed));
+    out = guestCacheAppendText(out, " bytes=");
+    out = guestCacheAppendU64(out, counters.bytes.load(std::memory_order_relaxed));
+    out = guestCacheAppendText(out, " ns=");
+    out = guestCacheAppendU64(out, counters.ns.load(std::memory_order_relaxed));
+    *out++ = '\n';
+#if defined(__linux__)
+    const ssize_t written = ::write(STDERR_FILENO, buffer, static_cast<size_t>(out - buffer));
+    (void)written;
+#endif
+}
+
+static inline void guestCacheStatsSignalHandler(int) { guestCacheStatsPrint(); }
+
+static inline void guestCacheStatsInstall() {
+    // Runs once, from guestCacheResolveConfig(), which is serialized by the
+    // init mutex. atexit covers a normal shutdown; SIGUSR1 snapshots a running
+    // compositor. An application that installs its own SIGUSR1 handler after us
+    // replaces ours; the atexit dump still runs.
+    (void)std::atexit(&guestCacheStatsPrint);
+#if defined(__linux__)
+    struct sigaction action = {};
+    action.sa_handler = &guestCacheStatsSignalHandler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    (void)sigaction(SIGUSR1, &action, nullptr);
+#endif
+}
+
+// Only called when kGuestCacheModeStats is set.
+static inline void guestCacheStatsRecord(GuestCacheStatEvent event, uint64_t bytes, uint64_t ns) {
+    GuestCacheCounters& counters = guestCacheCounters();
+    switch (event) {
+        case kGuestCacheStatMap:
+            counters.maps.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case kGuestCacheStatUnmap:
+            counters.unmaps.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case kGuestCacheStatWait:
+            counters.waits.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case kGuestCacheStatNone:
+            break;
+    }
+    if (bytes) counters.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (ns) counters.ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+// ------------------------------------------------------- UCI capability probe
+//
+// EL0 access to dc cvac/civac depends on SCTLR_EL1.UCI. Userspace cannot read
+// that bit and /proc/cpuinfo has no field for it, so the only reliable check is
+// to execute the instruction once and recover from the illegal-instruction
+// fault. The handler only recovers when the fault address is the probed
+// instruction itself, so an unrelated SIGILL keeps its usual effect.
+#if defined(__aarch64__) && defined(__linux__)
+static sigjmp_buf guestCacheProbeJump;
+static volatile sig_atomic_t guestCacheProbeActive = 0;
+static volatile uintptr_t guestCacheProbePc = 0;
+
+static void guestCacheProbeSigill(int, siginfo_t* info, void*) {
+    if (guestCacheProbeActive && info &&
+        reinterpret_cast<uintptr_t>(info->si_addr) == guestCacheProbePc) {
+        guestCacheProbeActive = 0;
+        siglongjmp(guestCacheProbeJump, 1);
+    }
+    // Not the probe: restore the default disposition and let the fault take the
+    // course it would have taken without the probe.
+    struct sigaction dfl = {};
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    (void)sigaction(SIGILL, &dfl, nullptr);
+    raise(SIGILL);
+}
+
+__attribute__((noinline)) static void guestCacheProbeExecute(void* line) {
+    // Label 2 is the dc instruction itself, four bytes after the adr.
+    __asm__ volatile(
+        "adr x9, 2f\n\t"
+        "str x9, [%0]\n\t"
+        "2:\n\t"
+        "dc civac, %1\n\t"
+        :
+        : "r"(&guestCacheProbePc), "r"(line)
+        : "x9", "memory");
+}
+
+__attribute__((noinline)) static int guestCacheProbeEl0Maintenance() {
+    alignas(64) unsigned char line[64] = {};
+    struct sigaction previous = {};
+    struct sigaction action = {};
+    action.sa_sigaction = &guestCacheProbeSigill;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGILL, &action, &previous) != 0) return 0;
+    guestCacheProbeActive = 1;
+    volatile int faulted = sigsetjmp(guestCacheProbeJump, 1);
+    if (!faulted) guestCacheProbeExecute(line);
+    guestCacheProbeActive = 0;
+    (void)sigaction(SIGILL, &previous, nullptr);
+    return faulted ? 0 : 1;
+}
+#else
+// Non-aarch64: the cache operations above are no-ops, nothing to probe.
+static inline int guestCacheProbeEl0Maintenance() { return -1; }
+#endif
+
+// The only log line in this header, and only with
+// GFXSTREAM_GUEST_INVALIDATE_DEBUG=1/u on/true. el0 is 1 (works), 0 (SIGILL,
+// maintenance disabled) or -1 (not probed, either because maintenance is off or
+// because this architecture has no such instruction).
+static inline void guestCacheDebugLog(uint32_t mode, bool stats, int el0) {
+    std::fprintf(stderr, "GUEST-CMO-CONFIG mode=0x%08x stats=%d el0=%d\n",
+                 static_cast<unsigned>(mode), stats ? 1 : 0, el0);
+}
+
+// Runs once per process, inside the init mutex. mode may be rewritten to "off"
+// when the UCI probe fails, which is the fail-closed answer: the pre-patch
+// behaviour instead of a SIGILL on the first maintenance.
+static inline uint32_t guestCacheResolveConfig() {
+    const GuestCacheConfig config = guestCacheConfigFromEnvValues(
+        getenv("GFXSTREAM_GUEST_INVALIDATE"), getenv("GFXSTREAM_GUEST_INVALIDATE_STATS"),
+        getenv("GFXSTREAM_GUEST_INVALIDATE_DEBUG"));
+    uint32_t mode = config.mode;
+    int el0 = -1;
+    if ((mode & kGuestCacheModeAll) != kGuestCacheModeOff) {
+        el0 = guestCacheProbeEl0Maintenance();
+        if (el0 == 0) mode = kGuestCacheModeOff;
+    }
+    if (config.stats) guestCacheStatsInstall();
+    if (config.debug) guestCacheDebugLog(mode, config.stats, el0);
+    return mode;
+}
+
+// One relaxed load on the normal path. The one-time parse is serialized by a
+// statically initialized mutex: no static-constructor ordering, no exception
+// can escape (pthread_mutex_lock returns an error code), and two threads racing
+// at first use cannot run the probe concurrently.
+static inline uint32_t guestCacheMaintenanceMode() {
+    static std::atomic<uint32_t> resolved{kGuestCacheConfigUnparsed};
+    uint32_t value = resolved.load(std::memory_order_acquire);
+    if (value != kGuestCacheConfigUnparsed) return value;
+#if defined(__linux__)
+    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    (void)pthread_mutex_lock(&mutex);
+    value = resolved.load(std::memory_order_relaxed);
+    if (value == kGuestCacheConfigUnparsed) {
+        value = guestCacheResolveConfig();
+        resolved.store(value, std::memory_order_release);
+    }
+    (void)pthread_mutex_unlock(&mutex);
+#else
+    value = guestCacheResolveConfig();
+    resolved.store(value, std::memory_order_release);
+#endif
+    return value;
+}
+
+static inline bool guestCacheStatsEnabled() {
+    return (guestCacheMaintenanceMode() & kGuestCacheModeStats) != 0;
+}
+
 }  // namespace vk
 }  // namespace gfxstream
 '''
@@ -227,19 +542,19 @@ RT_CPP_ANCHOR_OLD = '''    if (size == VK_WHOLE_SIZE) {
 '''
 
 RT_CPP_HELPERS = r'''
-// Guest CPU cache maintenance for direct-mapped host-visible memory. The
-// default (GFXSTREAM_GUEST_INVALIDATE unset/empty/0/off) leaves the historical
-// behaviour untouched: both entry points return before reading any state.
-static uint32_t guestCacheMaintenanceMode() {
-    static const uint32_t mode = guestCacheModeFromEnvValue(getenv("GFXSTREAM_GUEST_INVALIDATE"));
-    return mode;
-}
+// Guest CPU cache maintenance for direct-mapped host-visible memory. The mode
+// comes from GuestCacheMaintenance.h: every mechanism is on unless
+// GFXSTREAM_GUEST_INVALIDATE=0/off, and each entry point still returns before
+// reading any state when its mechanism is off.
 
 void ResourceTracker::guestCacheMaintainMappedRanges(const VkMappedMemoryRange* pMemoryRanges,
                                                      uint32_t memoryRangeCount, bool invalidate) {
     if (!(guestCacheMaintenanceMode() & kGuestCacheModeA1)) return;
     if (!pMemoryRanges || !memoryRangeCount) return;
 
+    const bool guestCacheStats = guestCacheStatsEnabled();
+    const uint64_t guestCacheStart = guestCacheStats ? guestCacheNowNs() : 0;
+    uint64_t guestCacheBytes = 0;
     std::lock_guard<std::recursive_mutex> lock(mLock);
     bool maintained = false;
     for (uint32_t i = 0; i < memoryRangeCount; ++i) {
@@ -259,14 +574,21 @@ void ResourceTracker::guestCacheMaintainMappedRanges(const VkMappedMemoryRange* 
                 guestCacheCleanLine(memoryInfo.ptr + offset);
             }
         }
+        guestCacheBytes += range.end - range.begin;
         maintained = true;
     }
     if (maintained) guestCacheSync();
+    if (guestCacheStats)
+        guestCacheStatsRecord(kGuestCacheStatNone, guestCacheBytes,
+                              guestCacheNowNs() - guestCacheStart);
 }
 
 void ResourceTracker::guestCacheInvalidateMappedCoherent() {
     if (!(guestCacheMaintenanceMode() & kGuestCacheModeA2)) return;
 
+    const bool guestCacheStats = guestCacheStatsEnabled();
+    const uint64_t guestCacheStart = guestCacheStats ? guestCacheNowNs() : 0;
+    uint64_t guestCacheBytes = 0;
     std::lock_guard<std::recursive_mutex> lock(mLock);
     bool invalidated = false;
     for (const auto& [memory, memoryInfo] : info_VkDeviceMemory) {
@@ -285,14 +607,18 @@ void ResourceTracker::guestCacheInvalidateMappedCoherent() {
              offset += kGuestCacheLineSize) {
             guestCacheCleanAndInvalidateLine(memoryInfo.ptr + offset);
         }
+        guestCacheBytes += memoryInfo.allocationSize;
         invalidated = true;
     }
     if (invalidated) guestCacheSync();
+    if (guestCacheStats)
+        guestCacheStatsRecord(kGuestCacheStatWait, guestCacheBytes,
+                              guestCacheNowNs() - guestCacheStart);
 }
 
 void ResourceTracker::guestCacheMaintainMappedAllocation(VkDeviceMemory memory, uint64_t offset,
                                                          uint64_t size, uint64_t limit,
-                                                         bool invalidate) {
+                                                         bool invalidate, uint32_t statEvent) {
     std::lock_guard<std::recursive_mutex> lock(mLock);
     auto it = info_VkDeviceMemory.find(memory);
     if (it == info_VkDeviceMemory.end()) return;
@@ -314,6 +640,8 @@ void ResourceTracker::guestCacheMaintainMappedAllocation(VkDeviceMemory memory, 
 
     const GuestCacheRange range = guestCacheRangeForMappedMemory(limit, offset, size);
     if (range.begin >= range.end) return;
+    const bool guestCacheStats = guestCacheStatsEnabled();
+    const uint64_t guestCacheStart = guestCacheStats ? guestCacheNowNs() : 0;
     for (uint64_t line = range.begin; line < range.end; line += kGuestCacheLineSize) {
         if (invalidate) {
             guestCacheCleanAndInvalidateLine(memoryInfo.ptr + line);
@@ -322,6 +650,9 @@ void ResourceTracker::guestCacheMaintainMappedAllocation(VkDeviceMemory memory, 
         }
     }
     guestCacheSync();
+    if (guestCacheStats)
+        guestCacheStatsRecord(static_cast<GuestCacheStatEvent>(statEvent),
+                              range.end - range.begin, guestCacheNowNs() - guestCacheStart);
 }
 '''
 
@@ -379,8 +710,8 @@ RT_CPP_MAP_NEW = '''    *ppData = deviceMemoryInfo.ptr + offset;
     // it is unmapped (VUID-vkFreeMemory-memory-00677), so the pointer cannot be
     // stale here. CMap: a GPU write may have landed while nothing was mapped
     // (screenshot readback: render, then map the PBO and read it), so
-    // clean+invalidate (dc civac) before the pointer is returned. Both are
-    // opt-in and neither runs on the submission path.
+    // clean+invalidate (dc civac) before the pointer is returned. Both run on
+    // the mapping path only, never on the submission path.
     {
         const uint32_t guestCacheMode = guestCacheMaintenanceMode();
         if (guestCacheMode & (kGuestCacheModeCMap | kGuestCacheModeCUnmap)) {
@@ -392,7 +723,7 @@ RT_CPP_MAP_NEW = '''    *ppData = deviceMemoryInfo.ptr + offset;
             }
             if (guestCacheMode & kGuestCacheModeCMap) {
                 guestCacheMaintainMappedAllocation(memory, offset, size, guestCacheLimit,
-                                                   /*invalidate=*/true);
+                                                   /*invalidate=*/true, kGuestCacheStatMap);
             }
         }
     }
@@ -418,7 +749,7 @@ RT_CPP_UNMAP_NEW = '''void ResourceTracker::on_vkUnmapMemory(void*, VkDevice, Vk
     guestCacheMaintainMappedAllocation(memory, memoryInfo.guestCacheMappedOffset,
                                        memoryInfo.guestCacheMappedSize,
                                        memoryInfo.guestCacheMappedLimit,
-                                       /*invalidate=*/false);
+                                       /*invalidate=*/false, kGuestCacheStatUnmap);
 }
 '''
 
@@ -431,10 +762,10 @@ RT_H_STRUCT_NEW = '''        CoherentMemoryPtr coherentMemory = nullptr;
         VirtGpuResourcePtr blobPtr = nullptr;
         int importedFd = -1;
 
-        // Range recorded by the last successful vkMapMemory, for the opt-in
-        // clean at vkUnmapMemory. Offsets are relative to ptr; limit is the
-        // allocation size used to resolve VK_WHOLE_SIZE (allocationSize, or
-        // the host-reported blob size for the export route).
+        // Range recorded by the last successful vkMapMemory, for the clean at
+        // vkUnmapMemory. Offsets are relative to ptr; limit is the allocation
+        // size used to resolve VK_WHOLE_SIZE (allocationSize, or the
+        // host-reported blob size for the export route).
         uint64_t guestCacheMappedOffset = 0;
         uint64_t guestCacheMappedSize = 0;
         uint64_t guestCacheMappedLimit = 0;
@@ -458,7 +789,6 @@ RT_CPP_WAIT_FENCES_OLD = '''    if (!fencesNonExternal.empty()) {
     return enc->vkWaitForFences(device, fenceCount, pFences, waitAll, timeout, true /* do lock */);
 #endif
 '''
-
 RT_CPP_WAIT_FENCES_NEW = '''    if (!fencesNonExternal.empty()) {
         auto hostConn = ResourceTracker::threadingCallbacks.hostConnectionGetFunc();
         auto vkEncoder = ResourceTracker::threadingCallbacks.vkEncoderGetFunc(hostConn);
@@ -518,12 +848,14 @@ RT_H_NEW = '''    uint8_t* getMappedPointer(VkDeviceMemory memory);
     bool isValidMemoryRange(const VkMappedMemoryRange& range);
 
     // Guest CPU cache maintenance; no-ops unless GFXSTREAM_GUEST_INVALIDATE
-    // selects the matching mode. See GuestCacheMaintenance.h.
+    // selects the matching mode. statEvent is a GuestCacheStatEvent value (kept
+    // as uint32_t so this header stays free of GuestCacheMaintenance.h). See
+    // that header for the switch and the statistics.
     void guestCacheMaintainMappedRanges(const VkMappedMemoryRange* pMemoryRanges,
                                         uint32_t memoryRangeCount, bool invalidate);
     void guestCacheInvalidateMappedCoherent();
     void guestCacheMaintainMappedAllocation(VkDeviceMemory memory, uint64_t offset, uint64_t size,
-                                            uint64_t limit, bool invalidate);
+                                            uint64_t limit, bool invalidate, uint32_t statEvent);
 '''
 
 VALIDATION_FLUSH_OLD = '''VkResult Validation::on_vkFlushMappedMemoryRanges(void*, VkResult, VkDevice,
@@ -675,15 +1007,18 @@ def transform(root):
         ENCODER_REL: encoder.encode(),
     }
 
-    # No logging anywhere in the new code: with the switch off the output must
-    # be byte-for-byte the baseline, and with it on a busy desktop cannot afford
-    # a line per fence. (The checker also greps the emitted diff's added lines.)
+    # No logging on any path except the single configuration line that only
+    # runs with GFXSTREAM_GUEST_INVALIDATE_DEBUG=1. A busy desktop cannot
+    # afford a line per fence, and the default output must stay byte-for-byte
+    # the baseline.
     new_code = (HEADER + RT_CPP_HELPERS + RT_CPP_SETINFO_NEW + RT_CPP_MAP_LIMIT_DECL_NEW +
                 RT_CPP_MAP_LIMIT_SET_NEW + RT_CPP_MAP_NEW + RT_CPP_UNMAP_NEW +
                 VALIDATION_FLUSH_NEW + VALIDATION_INVALIDATE_NEW)
-    for token in ('mesa_log', 'printf', 'fprintf', 'puts(', 'std::cout'):
+    for token in ('mesa_log', 'puts(', 'std::cout'):
         if token in new_code:
             raise SystemExit(f'new code must not log ({token})')
+    if new_code.count('printf') != 1 or 'if (config.debug) guestCacheDebugLog(' not in HEADER:
+        raise SystemExit('the only log line must be the debug-gated configuration line')
 
     # Every cache operation sits behind a mode check. A1's, A2's and CUnmap's
     # gates are the first statement of their entry point; CMap is one branch of
@@ -695,8 +1030,29 @@ def transform(root):
             raise SystemExit(f'A1/A2/CUnmap gate missing or duplicated: {gate}')
     if rt_cpp.count('if (guestCacheMode & kGuestCacheModeCMap) {') != 1:
         raise SystemExit('CMap branch missing or duplicated')
-    if RT_CPP_HELPERS.count('getenv("GFXSTREAM_GUEST_INVALIDATE")') != 1:
-        raise SystemExit('exactly one environment read expected')
+    for name in (ENV_NAME, STATS_ENV_NAME, DEBUG_ENV_NAME):
+        if HEADER.count(f'getenv("{name}")') != 1:
+            raise SystemExit(f'exactly one getenv({name}) expected')
+        if f'getenv("{name}")' in rt_cpp:
+            raise SystemExit(f'{name} must only be read from the header')
+    if 'static const uint32_t mode =' in HEADER or 'static const uint32_t mode =' in rt_cpp:
+        raise SystemExit('config must not be a static const initializer')
+
+    # Statistics stay off the normal path: every clock read and every counter
+    # update is inside `if (guestCacheStats)` in the callers, and the counters
+    # are only touched by guestCacheStatsRecord().
+    if rt_cpp.count('guestCacheStatsRecord(') != 3:
+        raise SystemExit('expected three statistics call sites (A1, A2, map helper)')
+    if rt_cpp.count('guestCacheNowNs()') != 2 * rt_cpp.count('guestCacheStatsRecord('):
+        raise SystemExit('every guestCacheNowNs() must sit in a stats-guarded statement')
+    if 'fetch_add' in rt_cpp:
+        raise SystemExit('counters must only be updated inside GuestCacheMaintenance.h')
+    if HEADER.count('fetch_add') != 5:
+        raise SystemExit('expected five counter updates (maps/unmaps/waits/bytes/ns)')
+    if HEADER.count('clock_gettime(') != 1:
+        raise SystemExit('expected exactly one clock_gettime, inside guestCacheNowNs()')
+    if 'if (!(guestCacheStatsEnabled()))' in rt_cpp:
+        raise SystemExit('stats must be a branch, not a duplicated helper')
 
     return patched
 
@@ -722,6 +1078,12 @@ def assert_patch_contract(root, patched):
         raise SystemExit('allocation clamp missing')
     if header_text.count('size == UINT64_MAX || size > allocationSize - offset') != 1:
         raise SystemExit('overflow-safe range clamp missing')
+    if header_text.count('static std::atomic<uint32_t> resolved{kGuestCacheConfigUnparsed};') != 1:
+        raise SystemExit('the parsed mode must live in one atomic word')
+    if header_text.count('static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;') != 1:
+        raise SystemExit('the one-time parse must use a statically initialized mutex')
+    if 'GUEST-CMO-STATS maps=' not in header_text:
+        raise SystemExit('statistics line prefix missing')
 
     validation = patched[VALIDATION_REL].decode()
     if validation.count('guestCacheMaintainMappedRanges(') != 2:
@@ -732,7 +1094,8 @@ def assert_patch_contract(root, patched):
     header = patched[HEADER_REL].decode()
     for token in ('#if defined(__aarch64__)', 'dc civac', 'dc cvac', 'dsb sy',
                   'guestCacheModeFromEnvValue', 'guestCacheRangeForMappedMemory',
-                  'kGuestCacheModeCMap', 'kGuestCacheModeCUnmap', 'kGuestCacheModeAll'):
+                  'kGuestCacheModeCMap', 'kGuestCacheModeCUnmap', 'kGuestCacheModeAll',
+                  'guestCacheProbeEl0Maintenance', 'siglongjmp', 'PTHREAD_MUTEX_INITIALIZER'):
         if token not in header:
             raise SystemExit(f'header missing {token}')
     if '#include <vulkan' in header or 'VkDeviceSize' in header:
@@ -789,8 +1152,9 @@ def main():
     print('PASS A2: completion waits invalidate mapped declared-coherent allocations')
     print('PASS CMap: vkMapMemory invalidates the range it is about to hand to the CPU')
     print('PASS CUnmap: vkUnmapMemory cleans the range the application finished writing')
-    print('PASS default off: every entry point returns before reading any state')
-    print('PASS no new logging on any path')
+    print('PASS default on: unset/empty selects A1+A2+CMap+CUnmap; 0/off restores baseline')
+    print('PASS lazy config: one atomic word, pthread-once parse, no static initializer')
+    print('PASS stats: opt-in counters, zero counters and clock reads when off')
     print('guest readback invalidate patched')
 
 
