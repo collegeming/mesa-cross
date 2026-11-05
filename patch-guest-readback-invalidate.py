@@ -9,26 +9,41 @@ old contents. zink trusts the coherent flag and never calls
 vkInvalidateMappedMemoryRanges, so a screenshot staging buffer keeps 64 B lines
 of stale zeros (16 px * 4 B = one cache line).
 
-Two mechanisms, both behind GFXSTREAM_GUEST_INVALIDATE:
+Four mechanisms, all behind GFXSTREAM_GUEST_INVALIDATE:
 
-  A1  vkFlushMappedMemoryRanges / vkInvalidateMappedMemoryRanges really clean /
-      clean+invalidate the requested range instead of only forwarding the call
-      to the host (whose invalidate has no effect on the guest CPU cache).
-  A2  after a GPU completion wait (vkWaitSemaphores, vkWaitForFences,
-      vkQueueWaitIdle) clean+invalidate every mapped allocation that is
-      declared HOST_VISIBLE|HOST_COHERENT. This is the path that fixes zink,
-      which never calls invalidate for coherent memory.
+  A1     vkFlushMappedMemoryRanges / vkInvalidateMappedMemoryRanges really
+         clean / clean+invalidate the requested range instead of only
+         forwarding the call to the host (whose invalidate has no effect on
+         the guest CPU cache).
+  A2     after a GPU completion wait (vkWaitSemaphores, vkWaitForFences,
+         vkQueueWaitIdle) clean+invalidate every mapped allocation that is
+         declared HOST_VISIBLE|HOST_COHERENT. This is the path that fixes
+         zink, which never calls invalidate for coherent memory.
+  CMAP   clean+invalidate the range recorded by vkMapMemory just before the
+         pointer is returned, so a GPU write that landed while nothing was
+         mapped is visible to the CPU that is about to read it (screenshot
+         PBO readback).
+  CUNMAP clean the range recorded by vkMapMemory at vkUnmapMemory, so CPU
+         writes that are still dirty in cache reach the GPU that samples the
+         client buffer next (wl_shm upload, CPU-filled dmabuf).
 
-A1 uses dc cvac / dc civac at EL0, the only mechanism available to a userspace
-ICD: the virtio-gpu blob mapping is a plain GEM mmap, not a dma-buf, so
-DMA_BUF_IOCTL_SYNC is not applicable, and msync does no cache maintenance.
+CMAP/CUNMAP only act on direct-mapped host-visible memory that actually went
+through vkMapMemory; the range is the offset/size the application passed,
+clamped to the allocation and rounded out to whole 64 B lines. An allocation
+that was never mapped, or one whose type is not HOST_VISIBLE, is skipped.
+
+All four use dc cvac / dc civac at EL0, the only mechanism available to a
+userspace ICD: the virtio-gpu blob mapping is a plain GEM mmap, not a dma-buf,
+so DMA_BUF_IOCTL_SYNC is not applicable, and msync does no cache maintenance.
 Linux enables SCTLR_EL1.UCI for EL0 (the AArch64 ABI needs it for
 __clear_cache), and the guest native CMO probe completed
 "dsb sy; dc civac; dsb sy" with signal=0 on this kernel.
 
-Default behaviour is unchanged: with GFXSTREAM_GUEST_INVALIDATE unset, empty,
-"0" or "off" both entry points return before touching any state, and no log
-line is added anywhere.
+GFXSTREAM_GUEST_INVALIDATE accepts "1"/"on"/"all" for everything, or a
+comma-separated list of a1, a2, cmap, cunmap for device-side splitting.
+Default behaviour is unchanged: with the variable unset, empty, "0" or "off"
+every entry point returns before touching any state, and no log line is added
+anywhere.
 
 Patched files (pinned to cecc0e96):
   src/gfxstream/guest/vulkan_enc/GuestCacheMaintenance.h        (new)
@@ -94,21 +109,54 @@ static constexpr uint64_t kGuestCacheLineSize = 64;
 
 enum GuestCacheMode : uint32_t {
     kGuestCacheModeOff = 0,
-    kGuestCacheModeA1 = 1u << 0,  // honour vkFlush/vkInvalidateMappedMemoryRanges
-    kGuestCacheModeA2 = 1u << 1,  // invalidate declared-coherent memory after GPU completion
+    kGuestCacheModeA1 = 1u << 0,      // honour vkFlush/vkInvalidateMappedMemoryRanges
+    kGuestCacheModeA2 = 1u << 1,      // invalidate declared-coherent memory after GPU completion
+    kGuestCacheModeCMap = 1u << 2,    // invalidate the mapped range before vkMapMemory returns
+    kGuestCacheModeCUnmap = 1u << 3,  // clean the mapped range at vkUnmapMemory
+    kGuestCacheModeAll = kGuestCacheModeA1 | kGuestCacheModeA2 | kGuestCacheModeCMap |
+                         kGuestCacheModeCUnmap,
 };
 
 // Parsed once, by a caller-side function-local static (never a static
-// initializer). "a1" selects A1 only, "a2" A2 only; every other non-off value
-// selects both, so a typo widens the diagnostic instead of disabling it.
+// initializer). "1"/"on"/"all" select everything; otherwise the value is a
+// comma-separated list of a1, a2, cmap and cunmap. Unknown tokens select
+// everything, so a typo widens the diagnostic instead of disabling the fix.
 static inline uint32_t guestCacheModeFromEnvValue(const char* value) {
     if (!value || !value[0]) return kGuestCacheModeOff;
     if (value[0] == '0' && !value[1]) return kGuestCacheModeOff;
     if (value[0] == 'o' && value[1] == 'f' && value[2] == 'f' && !value[3])
         return kGuestCacheModeOff;
-    if (value[0] == 'a' && value[1] == '1' && !value[2]) return kGuestCacheModeA1;
-    if (value[0] == 'a' && value[1] == '2' && !value[2]) return kGuestCacheModeA2;
-    return kGuestCacheModeA1 | kGuestCacheModeA2;
+    if (value[0] == '1' && !value[1]) return kGuestCacheModeAll;
+    if (value[0] == 'o' && value[1] == 'n' && !value[2]) return kGuestCacheModeAll;
+    if (value[0] == 'a' && value[1] == 'l' && value[2] == 'l' && !value[3])
+        return kGuestCacheModeAll;
+
+    uint32_t mode = kGuestCacheModeOff;
+    const char* token = value;
+    while (*token) {
+        const char* end = token;
+        while (*end && *end != ',') ++end;
+        const uint64_t length = static_cast<uint64_t>(end - token);
+        if (length) {
+            uint32_t bit = 0;
+            if (length == 2 && token[0] == 'a' && token[1] == '1') {
+                bit = kGuestCacheModeA1;
+            } else if (length == 2 && token[0] == 'a' && token[1] == '2') {
+                bit = kGuestCacheModeA2;
+            } else if (length == 4 && token[0] == 'c' && token[1] == 'm' && token[2] == 'a' &&
+                       token[3] == 'p') {
+                bit = kGuestCacheModeCMap;
+            } else if (length == 6 && token[0] == 'c' && token[1] == 'u' && token[2] == 'n' &&
+                       token[3] == 'm' && token[4] == 'a' && token[5] == 'p') {
+                bit = kGuestCacheModeCUnmap;
+            } else {
+                return kGuestCacheModeAll;
+            }
+            mode |= bit;
+        }
+        token = *end ? end + 1 : end;
+    }
+    return mode ? mode : kGuestCacheModeAll;
 }
 
 struct GuestCacheRange {
@@ -241,6 +289,157 @@ void ResourceTracker::guestCacheInvalidateMappedCoherent() {
     }
     if (invalidated) guestCacheSync();
 }
+
+void ResourceTracker::guestCacheMaintainMappedAllocation(VkDeviceMemory memory, uint64_t offset,
+                                                         uint64_t size, uint64_t limit,
+                                                         bool invalidate) {
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+    auto it = info_VkDeviceMemory.find(memory);
+    if (it == info_VkDeviceMemory.end()) return;
+    const auto& memoryInfo = it->second;
+    // Direct-mapped memory is the only kind with a guest CPU pointer. An
+    // allocation that was never mapped has no range recorded, so the callers
+    // reach here only for memory the application actually mapped.
+    if (!memoryInfo.ptr) return;
+    auto deviceIt = info_VkDevice.find(memoryInfo.device);
+    if (deviceIt == info_VkDevice.end()) return;
+    const VkPhysicalDeviceMemoryProperties& memProps = deviceIt->second.memProps;
+    if (memoryInfo.memoryTypeIndex >= memProps.memoryTypeCount) return;
+    // Never touch a non-host-visible allocation: there is no CPU mapping whose
+    // cache could hold a stale or dirty line.
+    if (!(memProps.memoryTypes[memoryInfo.memoryTypeIndex].propertyFlags &
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+        return;
+    }
+
+    const GuestCacheRange range = guestCacheRangeForMappedMemory(limit, offset, size);
+    if (range.begin >= range.end) return;
+    for (uint64_t line = range.begin; line < range.end; line += kGuestCacheLineSize) {
+        if (invalidate) {
+            guestCacheCleanAndInvalidateLine(memoryInfo.ptr + line);
+        } else {
+            guestCacheCleanLine(memoryInfo.ptr + line);
+        }
+    }
+    guestCacheSync();
+}
+'''
+
+RT_CPP_SETINFO_OLD = '''    info.imported = imported;
+    info.vmoHandle = vmoHandle;
+    info.blobPtr = blobPtr;
+    info.importedFd = importedFd;
+}
+'''
+RT_CPP_SETINFO_NEW = '''    info.imported = imported;
+    info.vmoHandle = vmoHandle;
+    info.blobPtr = blobPtr;
+    info.importedFd = importedFd;
+    // A reused VkDeviceMemory handle must not inherit a mapping range from the
+    // allocation it replaced; only a successful vkMapMemory sets these again.
+    info.guestCacheMapped = false;
+    info.guestCacheMappedOffset = 0;
+    info.guestCacheMappedSize = 0;
+    info.guestCacheMappedLimit = 0;
+}
+'''
+
+RT_CPP_MAP_LIMIT_DECL_OLD = '''    auto& deviceMemoryInfo = deviceMemoryInfoIt->second;
+'''
+RT_CPP_MAP_LIMIT_DECL_NEW = '''    auto& deviceMemoryInfo = deviceMemoryInfoIt->second;
+
+    // Bound for the cache-maintenance range. Allocations from the export route
+    // record no allocationSize; the blob size the host reported replaces it
+    // when the mapping is created below.
+    uint64_t guestCacheLimit = deviceMemoryInfo.allocationSize;
+'''
+
+RT_CPP_MAP_LIMIT_SET_OLD = '''        deviceMemoryInfo.coherentMemoryOffset = offset;
+        deviceMemoryInfo.coherentMemory = coherentMemory;
+        deviceMemoryInfo.ptr = ptr;
+'''
+RT_CPP_MAP_LIMIT_SET_NEW = '''        deviceMemoryInfo.coherentMemoryOffset = offset;
+        deviceMemoryInfo.coherentMemory = coherentMemory;
+        deviceMemoryInfo.ptr = ptr;
+        // The blob mapping starts at ptr - offset and spans mapSize bytes, so
+        // the range the application can legally map ends at mapSize - offset.
+        guestCacheLimit = mapSize > offset ? mapSize - offset : 0;
+'''
+
+RT_CPP_MAP_OLD = '''    *ppData = deviceMemoryInfo.ptr + offset;
+
+    return host_result;
+}
+'''
+RT_CPP_MAP_NEW = '''    *ppData = deviceMemoryInfo.ptr + offset;
+
+    // ---- bidirectional cache maintenance for mapped host-visible memory ----
+    // CUnmap: the application has finished writing when it unmaps, so clean
+    // (dc cvac) exactly the range it mapped. The memory cannot be freed before
+    // it is unmapped (VUID-vkFreeMemory-memory-00677), so the pointer cannot be
+    // stale here. CMap: a GPU write may have landed while nothing was mapped
+    // (screenshot readback: render, then map the PBO and read it), so
+    // clean+invalidate (dc civac) before the pointer is returned. Both are
+    // opt-in and neither runs on the submission path.
+    {
+        const uint32_t guestCacheMode = guestCacheMaintenanceMode();
+        if (guestCacheMode & (kGuestCacheModeCMap | kGuestCacheModeCUnmap)) {
+            if (guestCacheMode & kGuestCacheModeCUnmap) {
+                deviceMemoryInfo.guestCacheMappedOffset = offset;
+                deviceMemoryInfo.guestCacheMappedSize = size;
+                deviceMemoryInfo.guestCacheMappedLimit = guestCacheLimit;
+                deviceMemoryInfo.guestCacheMapped = true;
+            }
+            if (guestCacheMode & kGuestCacheModeCMap) {
+                guestCacheMaintainMappedAllocation(memory, offset, size, guestCacheLimit,
+                                                   /*invalidate=*/true);
+            }
+        }
+    }
+
+    return host_result;
+}
+'''
+
+RT_CPP_UNMAP_OLD = '''void ResourceTracker::on_vkUnmapMemory(void*, VkDevice, VkDeviceMemory) {
+    // no-op
+}
+'''
+RT_CPP_UNMAP_NEW = '''void ResourceTracker::on_vkUnmapMemory(void*, VkDevice, VkDeviceMemory memory) {
+    if (!(guestCacheMaintenanceMode() & kGuestCacheModeCUnmap)) return;
+
+    std::lock_guard<std::recursive_mutex> lock(mLock);
+    auto it = info_VkDeviceMemory.find(memory);
+    if (it == info_VkDeviceMemory.end()) return;
+    auto& memoryInfo = it->second;
+    // Only memory that actually went through vkMapMemory has a recorded range.
+    if (!memoryInfo.guestCacheMapped) return;
+    memoryInfo.guestCacheMapped = false;
+    guestCacheMaintainMappedAllocation(memory, memoryInfo.guestCacheMappedOffset,
+                                       memoryInfo.guestCacheMappedSize,
+                                       memoryInfo.guestCacheMappedLimit,
+                                       /*invalidate=*/false);
+}
+'''
+
+RT_H_STRUCT_OLD = '''        CoherentMemoryPtr coherentMemory = nullptr;
+        VirtGpuResourcePtr blobPtr = nullptr;
+        int importedFd = -1;
+    };
+'''
+RT_H_STRUCT_NEW = '''        CoherentMemoryPtr coherentMemory = nullptr;
+        VirtGpuResourcePtr blobPtr = nullptr;
+        int importedFd = -1;
+
+        // Range recorded by the last successful vkMapMemory, for the opt-in
+        // clean at vkUnmapMemory. Offsets are relative to ptr; limit is the
+        // allocation size used to resolve VK_WHOLE_SIZE (allocationSize, or
+        // the host-reported blob size for the export route).
+        uint64_t guestCacheMappedOffset = 0;
+        uint64_t guestCacheMappedSize = 0;
+        uint64_t guestCacheMappedLimit = 0;
+        bool guestCacheMapped = false;
+    };
 '''
 
 RT_CPP_WAIT_FENCES_OLD = '''    if (!fencesNonExternal.empty()) {
@@ -323,6 +522,8 @@ RT_H_NEW = '''    uint8_t* getMappedPointer(VkDeviceMemory memory);
     void guestCacheMaintainMappedRanges(const VkMappedMemoryRange* pMemoryRanges,
                                         uint32_t memoryRangeCount, bool invalidate);
     void guestCacheInvalidateMappedCoherent();
+    void guestCacheMaintainMappedAllocation(VkDeviceMemory memory, uint64_t offset, uint64_t size,
+                                            uint64_t limit, bool invalidate);
 '''
 
 VALIDATION_FLUSH_OLD = '''VkResult Validation::on_vkFlushMappedMemoryRanges(void*, VkResult, VkDevice,
@@ -437,6 +638,16 @@ def transform(root):
                           f'{RT_CPP_REL}: include')
     rt_cpp = replace_once(rt_cpp, RT_CPP_ANCHOR_OLD, RT_CPP_ANCHOR_OLD + RT_CPP_HELPERS,
                           f'{RT_CPP_REL}: helpers')
+    rt_cpp = replace_once(rt_cpp, RT_CPP_SETINFO_OLD, RT_CPP_SETINFO_NEW,
+                          f'{RT_CPP_REL}: setDeviceMemoryInfo reset')
+    rt_cpp = replace_once(rt_cpp, RT_CPP_MAP_LIMIT_DECL_OLD, RT_CPP_MAP_LIMIT_DECL_NEW,
+                          f'{RT_CPP_REL}: map limit declaration')
+    rt_cpp = replace_once(rt_cpp, RT_CPP_MAP_LIMIT_SET_OLD, RT_CPP_MAP_LIMIT_SET_NEW,
+                          f'{RT_CPP_REL}: export-route map limit')
+    rt_cpp = replace_once(rt_cpp, RT_CPP_MAP_OLD, RT_CPP_MAP_NEW,
+                          f'{RT_CPP_REL}: vkMapMemory maintenance')
+    rt_cpp = replace_once(rt_cpp, RT_CPP_UNMAP_OLD, RT_CPP_UNMAP_NEW,
+                          f'{RT_CPP_REL}: vkUnmapMemory maintenance')
     rt_cpp = replace_once(rt_cpp, RT_CPP_WAIT_FENCES_OLD, RT_CPP_WAIT_FENCES_NEW,
                           f'{RT_CPP_REL}: vkWaitForFences')
     rt_cpp = replace_once(rt_cpp, RT_CPP_QUEUE_WAIT_OLD, RT_CPP_QUEUE_WAIT_NEW,
@@ -444,6 +655,8 @@ def transform(root):
 
     rt_h = replace_once(originals[RT_H_REL].decode('utf-8'), RT_H_OLD, RT_H_NEW,
                         f'{RT_H_REL}: declarations')
+    rt_h = replace_once(rt_h, RT_H_STRUCT_OLD, RT_H_STRUCT_NEW,
+                        f'{RT_H_REL}: mapped-range fields')
 
     validation = replace_once(originals[VALIDATION_REL].decode('utf-8'),
                               VALIDATION_FLUSH_OLD, VALIDATION_FLUSH_NEW,
@@ -465,17 +678,23 @@ def transform(root):
     # No logging anywhere in the new code: with the switch off the output must
     # be byte-for-byte the baseline, and with it on a busy desktop cannot afford
     # a line per fence. (The checker also greps the emitted diff's added lines.)
-    new_code = HEADER + RT_CPP_HELPERS + VALIDATION_FLUSH_NEW + VALIDATION_INVALIDATE_NEW
+    new_code = (HEADER + RT_CPP_HELPERS + RT_CPP_SETINFO_NEW + RT_CPP_MAP_LIMIT_DECL_NEW +
+                RT_CPP_MAP_LIMIT_SET_NEW + RT_CPP_MAP_NEW + RT_CPP_UNMAP_NEW +
+                VALIDATION_FLUSH_NEW + VALIDATION_INVALIDATE_NEW)
     for token in ('mesa_log', 'printf', 'fprintf', 'puts(', 'std::cout'):
         if token in new_code:
             raise SystemExit(f'new code must not log ({token})')
 
-    # Every cache operation sits behind a mode check. A1's gate is the first
-    # statement; A2's gate is the first statement.
+    # Every cache operation sits behind a mode check. A1's, A2's and CUnmap's
+    # gates are the first statement of their entry point; CMap is one branch of
+    # the block at the end of vkMapMemory.
     for gate in ('if (!(guestCacheMaintenanceMode() & kGuestCacheModeA1)) return;',
-                 'if (!(guestCacheMaintenanceMode() & kGuestCacheModeA2)) return;'):
+                 'if (!(guestCacheMaintenanceMode() & kGuestCacheModeA2)) return;',
+                 'if (!(guestCacheMaintenanceMode() & kGuestCacheModeCUnmap)) return;'):
         if rt_cpp.count(gate) != 1:
-            raise SystemExit(f'A2/A1 gate missing or duplicated: {gate}')
+            raise SystemExit(f'A1/A2/CUnmap gate missing or duplicated: {gate}')
+    if rt_cpp.count('if (guestCacheMode & kGuestCacheModeCMap) {') != 1:
+        raise SystemExit('CMap branch missing or duplicated')
     if RT_CPP_HELPERS.count('getenv("GFXSTREAM_GUEST_INVALIDATE")') != 1:
         raise SystemExit('exactly one environment read expected')
 
@@ -488,6 +707,16 @@ def assert_patch_contract(root, patched):
     # one in its non-Android/Linux fallback, one in vkQueueWaitIdle.
     if rt_cpp.count('guestCacheInvalidateMappedCoherent();') != 4:
         raise SystemExit('expected four A2 call sites in ResourceTracker.cpp')
+    # Definition, the vkMapMemory invalidate, and the vkUnmapMemory clean.
+    if rt_cpp.count('guestCacheMaintainMappedAllocation(') != 3:
+        raise SystemExit('expected definition plus CMap and CUnmap call sites')
+    if 'std::lock_guard<std::recursive_mutex> lock(mLock);' not in rt_cpp:
+        raise SystemExit('mapped-allocation helper must take the tracker lock')
+    if '(memProps.memoryTypes[memoryInfo.memoryTypeIndex].propertyFlags &\n' \
+       '          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)' not in rt_cpp:
+        raise SystemExit('mapped-allocation helper must filter to HOST_VISIBLE')
+    if 'guestCacheRangeForMappedMemory(limit, offset, size)' not in rt_cpp:
+        raise SystemExit('mapped-allocation helper must clamp the recorded range')
     header_text = patched[HEADER_REL].decode()
     if header_text.count('offset >= allocationSize') != 1:
         raise SystemExit('allocation clamp missing')
@@ -502,11 +731,17 @@ def assert_patch_contract(root, patched):
 
     header = patched[HEADER_REL].decode()
     for token in ('#if defined(__aarch64__)', 'dc civac', 'dc cvac', 'dsb sy',
-                  'guestCacheModeFromEnvValue', 'guestCacheRangeForMappedMemory'):
+                  'guestCacheModeFromEnvValue', 'guestCacheRangeForMappedMemory',
+                  'kGuestCacheModeCMap', 'kGuestCacheModeCUnmap', 'kGuestCacheModeAll'):
         if token not in header:
             raise SystemExit(f'header missing {token}')
     if '#include <vulkan' in header or 'VkDeviceSize' in header:
         raise SystemExit('header must stay Vulkan-independent for the host unit test')
+
+    rt_h = patched[RT_H_REL].decode()
+    if rt_h.count('guestCacheMapped = false;') != 1 or \
+       rt_h.count('uint64_t guestCacheMappedOffset = 0;') != 1:
+        raise SystemExit('VkDeviceMemory_Info mapped-range fields missing')
 
     encoder = patched[ENCODER_REL].decode()
     if encoder.count('guestCacheInvalidateMappedCoherent') != 1:
@@ -552,7 +787,9 @@ def main():
         print(f'PATCHED {rel} sha256={sha256(patched[rel])}')
     print('PASS A1: flush/invalidate perform dc cvac / dc civac on the clamped range')
     print('PASS A2: completion waits invalidate mapped declared-coherent allocations')
-    print('PASS default off: both entry points return before reading any state')
+    print('PASS CMap: vkMapMemory invalidates the range it is about to hand to the CPU')
+    print('PASS CUnmap: vkUnmapMemory cleans the range the application finished writing')
+    print('PASS default off: every entry point returns before reading any state')
     print('PASS no new logging on any path')
     print('guest readback invalidate patched')
 
