@@ -50,11 +50,12 @@ jobs:
       # MESA_VK_WSI_DEBUG=linear sets wsi_device->wants_linear, but at cecc0e96
       # only the CPU-image path honours it. The Wayland DRM swapchain took its
       # modifier list from the compositor's dma-buf feedback, and the host
-      # driver rejected the modifier in vkCreateSwapchainKHR. With wants_linear
-      # the guest now asks for exactly DRM_FORMAT_MOD_LINEAR when the selected
-      # format advertises it; a format without LINEAR keeps the compositor list
-      # and logs once.
-      - name: Apply guest Wayland WSI linear-modifier patch and assert boundaries
+      # driver rejected the modifier in vkCreateSwapchainKHR. The feedback for a
+      # new wl_surface arrives asynchronously, so a rapidly reopened panel can
+      # still see an empty list; v2 therefore forces exactly one
+      # DRM_FORMAT_MOD_LINEAR whenever wants_linear is set, and only warns (once)
+      # when the compositor did not advertise LINEAR.
+      - name: Apply guest Wayland WSI forced-LINEAR patch (v2) and assert boundaries
         shell: bash
         run: |
           set -euo pipefail
@@ -148,10 +149,10 @@ jobs:
             printf 'RUN_URL=%s\nRECIPE_REPOSITORY=%s\nRECIPE_REF=%s\nRECIPE_SHA=%s\n' "$RUN_URL" "$GITHUB_REPOSITORY" "$GITHUB_REF" "$RECIPE_SHA"
             printf 'MESA_URL=%s\nVULKAN_HEADERS=1.4.358\nRELEASE=false\n' "$MESA_URL"
             printf 'MESA_TREE=%s\n' "$(git -C "$MESA_SRC_DIR" rev-parse 'HEAD^{tree}')"
-            printf 'MESA_PATCH=guest-readback-invalidate-a1-a2-cmap-cunmap-default-on-stats-v3+guest-wsi-linear-modifier-v1\nMESA_WORKTREE_DIRTY=true\n'
+            printf 'MESA_PATCH=guest-readback-invalidate-a1-a2-cmap-cunmap-default-on-stats-v3+guest-wsi-linear-modifier-v2\nMESA_WORKTREE_DIRTY=true\n'
             printf 'GFXSTREAM_GUEST_INVALIDATE=on_by_default; =0|off disables; modes=1|on|all|a1|a2|cmap|cunmap|comma-list\n'
             printf 'GFXSTREAM_GUEST_INVALIDATE_STATS=opt_in; GUEST-CMO-STATS line at exit or SIGUSR1\n'
-            printf 'MESA_VK_WSI_DEBUG=linear forces one DRM_FORMAT_MOD_LINEAR Wayland swapchain modifier when advertised\n'
+            printf 'MESA_VK_WSI_DEBUG=linear forces one DRM_FORMAT_MOD_LINEAR Wayland swapchain modifier unconditionally\n'
             sha256sum patch-guest-readback-invalidate.py check-guest-readback-invalidate.py test-guest-cache-maintenance.cpp out/guest-readback-invalidate.patch patch-guest-wsi-linear.py check-guest-wsi-linear.py out/guest-wsi-linear.patch out/patched-sources.sha256
             docker image inspect droidvm-mesa-cross:latest --format 'DOCKER_IMAGE_ID={{.Id}}'
             sha256sum Dockerfile.mesa-cross build.sh build-in-container.sh ci-build.sh mesa-config.sh package.sh aarch64-linux-gnu.meson aarch64-llvm-config ubuntu.sources

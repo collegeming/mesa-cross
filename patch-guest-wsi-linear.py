@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
-"""Make MESA_VK_WSI_DEBUG=linear reach the Wayland DRM swapchain.
+"""Make MESA_VK_WSI_DEBUG=linear force LINEAR on the Wayland DRM swapchain.
 
 wsi_device->wants_linear is set from WSI_DEBUG_LINEAR, but at cecc0e96 only the
-CPU-image path consults it (wsi_configure_cpu_image). The Wayland DRM path in
-wsi_wl_surface_create_swapchain takes its modifier list from the compositor's
-dma-buf feedback (or from the display's advertised format list) and passes it
-to wsi_swapchain_init unchanged. The host driver may reject the modifier the
-guest picked: gfxstream + Mali returns
-VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT from vkCreateSwapchainKHR
-and zink then has no swapchain at all.
+CPU-image path consults it. The Wayland DRM path in wsi_wl_surface_create_swapchain
+takes its modifier list from the compositor's dma-buf feedback (or from the
+display's advertised format list) and passes it to wsi_swapchain_init unchanged.
+The host driver may reject the modifier the guest picked: gfxstream + Mali
+returns VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT from
+vkCreateSwapchainKHR and zink then has no swapchain at all.
+
+v1 only switched to LINEAR when the selected format already advertised it. A new
+wl_surface receives its dma-buf feedback asynchronously, so quickly reopening a
+panel can observe a format whose modifier vector is still empty; v1 then kept
+the empty list, WSI created the swapchain with no modifier, the driver chose a
+tiled default and the host rejected it. v2 therefore forces LINEAR
+unconditionally:
+
+  * when wsi_device->wants_linear is true and the DRM branch selected a format
+    (`f != NULL`), the swapchain always gets exactly one
+    DRM_FORMAT_MOD_LINEAR modifier and num_modifier_lists == 1, whatever the
+    compositor advertised -- empty list, list without LINEAR, or a list with
+    LINEAR;
+  * if the advertised list is empty or lacks LINEAR, one rate-limited warning
+    (mesa_logw_once) records that the compositor did not advertise it, and the
+    code still forces LINEAR; it never falls back to the original list.
 
 This patch touches only src/vulkan/wsi/wsi_common_wayland.c and inserts two
 blocks, leaving every existing line byte-for-byte unchanged:
@@ -17,13 +32,9 @@ blocks, leaving every existing line byte-for-byte unchanged:
     DRM_FORMAT_MOD_LINEAR;`, so the pointer the code hands to
     wsi_swapchain_init stays valid for the whole process and is copied
     synchronously by the callee;
-  * inside `if (f != NULL)` in the DRM branch, when
-    wsi_device->wants_linear is true and the selected format advertises
-    DRM_FORMAT_MOD_LINEAR, force exactly that one modifier
-    (num_drm_modifiers = 1, num_modifier_lists = 1). When LINEAR is not
-    advertised, the compositor's list is kept as-is, because forcing an
-    unadvertised modifier can itself make vkCreateSwapchainKHR fail, and one
-    rate-limited warning (mesa_logw_once) is logged.
+  * inside `if (f != NULL)` in the DRM branch, the wants_linear gate described
+    above, placed after the compositor list has been read and before the
+    num_modifier_lists bookkeeping.
 
 With wants_linear false the inserted branch is a single false predicate and the
 modifier list, num_modifier_lists and the pointers stored in the chain are
@@ -58,7 +69,9 @@ DECL_INSERT = '''/* MESA_VK_WSI_DEBUG=linear sets wsi_device->wants_linear, but 
  * vkCreateSwapchainKHR), which leaves zink without a swapchain. A single LINEAR
  * entry keeps the guest-side drm_modifier/wl_buffer metadata consistent with the
  * allocation the host is asked to make. File scope keeps the pointer valid while
- * wsi_swapchain_init copies the list.
+ * wsi_swapchain_init copies the list. The feedback for a new wl_surface arrives
+ * asynchronously, so the modifier list can still be empty here; wants_linear
+ * forces LINEAR regardless.
  */
 static const uint64_t wsi_wl_linear_modifier = DRM_FORMAT_MOD_LINEAR;
 
@@ -79,17 +92,18 @@ BODY_INSERT = '''            if (wsi_device->wants_linear) {
                      break;
                   }
                }
-               if (has_linear) {
-                  num_drm_modifiers = 1;
-                  drm_modifiers = &wsi_wl_linear_modifier;
-               } else {
-                  /* Forcing a modifier the compositor did not advertise can
-                   * make vkCreateSwapchainKHR fail; keep the original list. */
-                  mesa_logw_once("wsi_wayland: wants_linear set but LINEAR is "
-                                 "not among the %u advertised modifier(s); "
-                                 "keeping the compositor list",
+               if (!has_linear) {
+                  /* A new wl_surface receives its dma-buf feedback
+                   * asynchronously, so a rapidly reopened panel can see an
+                   * empty list. Asking for no modifier lets the driver pick a
+                   * tiled default the host rejects, so force LINEAR anyway. */
+                  mesa_logw_once("wsi_wayland: wants_linear but the compositor "
+                                 "advertised no LINEAR modifier (count=%u); "
+                                 "forcing LINEAR",
                                  num_drm_modifiers);
                }
+               num_drm_modifiers = 1;
+               drm_modifiers = &wsi_wl_linear_modifier;
             }
 '''
 
@@ -98,9 +112,10 @@ BODY_INSERT = '''            if (wsi_device->wants_linear) {
 UNIQUE_TOKENS = (
     'static const uint64_t wsi_wl_linear_modifier = DRM_FORMAT_MOD_LINEAR;',
     '            if (wsi_device->wants_linear) {\n',
-    '                  num_drm_modifiers = 1;\n',
-    '                  drm_modifiers = &wsi_wl_linear_modifier;\n',
-    'mesa_logw_once("wsi_wayland: wants_linear set but LINEAR is "',
+    '               }\n'
+    '               num_drm_modifiers = 1;\n'
+    '               drm_modifiers = &wsi_wl_linear_modifier;\n',
+    'mesa_logw_once("wsi_wayland: wants_linear but the compositor "',
 )
 
 
@@ -148,7 +163,7 @@ def transform(root):
         if text.count(anchor) != 1:
             raise SystemExit(f'anchor lost after patching: {anchor!r}')
 
-    # Only one log call, and it is the rate-limited one in the else branch.
+    # Only one log call, and it is the rate-limited one in the warning branch.
     if text.count('mesa_logw_once(') != 1:
         raise SystemExit('expected exactly one mesa_logw_once')
     for token in ('fprintf(', 'puts(', 'std::cout'):
@@ -164,6 +179,20 @@ def transform(root):
     pos_book = text.index(ANCHOR_BODY)
     if not (pos_f < pos_len < pos_tail < pos_gate < pos_book):
         raise SystemExit('wants_linear gate is not between the list selection and the bookkeeping')
+
+    # The force is unconditional: the two assignments sit after the warning
+    # branch closes and still inside the gate, so an empty list, a list without
+    # LINEAR and a list with LINEAR all end at the same single modifier.
+    tail = ('               }\n'
+            '               num_drm_modifiers = 1;\n'
+            '               drm_modifiers = &wsi_wl_linear_modifier;\n'
+            '            }\n')
+    if text.count(tail) != 1:
+        raise SystemExit('LINEAR assignments are not unconditional at the end of the gate')
+    if 'if (has_linear) {' in text:
+        raise SystemExit('the positive has_linear branch must not exist any more')
+    if 'continue;' in BODY_INSERT or 'return' in BODY_INSERT:
+        raise SystemExit('the gate must not leave the function')
 
     # The original bookkeeping is intact and still decides num_modifier_lists.
     needle = ('            if (num_drm_modifiers > 0)\n'
@@ -215,10 +244,11 @@ def main():
         write_diff(patched, base, args.diff)
 
     print('PASS gated: only wsi_device->wants_linear changes the DRM modifier list')
-    print('PASS linear: exactly DRM_FORMAT_MOD_LINEAR, one list, one modifier')
-    print('PASS fallback: a format without LINEAR keeps the compositor list, one warning')
+    print('PASS forced: exactly DRM_FORMAT_MOD_LINEAR, one list, one modifier, always')
+    print('PASS race: an empty or LINEAR-less advertised list still forces LINEAR')
+    print('PASS warning: one rate-limited message when LINEAR was not advertised')
     print('PASS baseline: no original line changes; wants_linear false is the old path')
-    print('guest wsi linear patched')
+    print('guest wsi linear v2 patched')
 
 
 if __name__ == '__main__':
