@@ -7,7 +7,9 @@ it does two things that are still meaningful:
 
   * source assertions: the switch is read once and lazily, every cache operation
     sits behind it, both range clamps are present, the aarch64 instructions are
-    the expected ones, and the emitted diff adds no logging on any path;
+    the expected ones, the CMap/CUnmap hooks use the range recorded at map
+    time and refuse unmapped/non-host-visible allocations, and the emitted diff
+    adds no logging on any path;
   * a model of the range math and of the environment parser, checked against the
     same edge cases the host-compiled unit test (test-guest-cache-maintenance.cpp)
     runs against the real header.
@@ -65,11 +67,17 @@ def model_mode(value):
         return 0
     if value == 'off':
         return 0
-    if value == 'a1':
-        return 1
-    if value == 'a2':
-        return 2
-    return 3
+    if value in ('1', 'on', 'all'):
+        return 15
+    mode = 0
+    for token in value.split(','):
+        if not token:
+            continue
+        bit = {'a1': 1, 'a2': 2, 'cmap': 4, 'cunmap': 8}.get(token)
+        if bit is None:
+            return 15
+        mode |= bit
+    return mode or 15
 
 
 def function_region(text, signature):
@@ -114,6 +122,12 @@ def main():
           'header stays Vulkan-independent (host unit test)')
     check('static constexpr uint64_t kGuestCacheLineSize = 64;' in header,
           'cache line size is the architectural minimum')
+    check('kGuestCacheModeCMap = 1u << 2' in header, 'CMap is an independent mode bit')
+    check('kGuestCacheModeCUnmap = 1u << 3' in header, 'CUnmap is an independent mode bit')
+    check('kGuestCacheModeAll = kGuestCacheModeA1 | kGuestCacheModeA2 | kGuestCacheModeCMap |'
+          in header, 'the "all" mask covers every mode')
+    check("while (*end && *end != ',') ++end;" in header,
+          'the environment parser accepts a comma-separated list')
     for token in ('if (!allocationSize || offset >= allocationSize)',
                   'size == UINT64_MAX || size > allocationSize - offset'):
         check(token in header, 'range clamp present: ' + token)
@@ -122,6 +136,14 @@ def main():
     check('void guestCacheMaintainMappedRanges(const VkMappedMemoryRange* pMemoryRanges,' in rt_h,
           'A1 helper declared')
     check('void guestCacheInvalidateMappedCoherent();' in rt_h, 'A2 helper declared')
+    check('void guestCacheMaintainMappedAllocation(VkDeviceMemory memory, uint64_t offset, '
+          'uint64_t size,' in rt_h, 'CMap/CUnmap helper declared')
+    check('uint64_t guestCacheMappedOffset = 0;' in rt_h,
+          'VkDeviceMemory_Info records the map offset')
+    check('uint64_t guestCacheMappedSize = 0;' in rt_h,
+          'VkDeviceMemory_Info records the map size')
+    check('bool guestCacheMapped = false;' in rt_h,
+          'VkDeviceMemory_Info records that a map actually happened')
 
     # ------------------------------------------------------------- env switch
     occurrences = rt_cpp.count(f'getenv("{ENV_NAME}")')
@@ -159,11 +181,62 @@ def main():
           'A2 is bounded by the allocation size')
     check('if (invalidated) guestCacheSync();' in a2, 'A2 only issues dsb after real work')
 
+    # ------------------------------------------------------- CMap/CUnmap paths
+    map_func = function_region(rt_cpp, 'VkResult ResourceTracker::on_vkMapMemory(')
+    check('uint64_t guestCacheLimit = deviceMemoryInfo.allocationSize;' in map_func,
+          'CMap/CUnmap resolve the map bound from the allocation size')
+    check('guestCacheLimit = mapSize > offset ? mapSize - offset : 0;' in map_func,
+          'the export route uses the host-reported blob size as the bound')
+    check('*ppData = deviceMemoryInfo.ptr + offset;' in map_func,
+          'the recorded range starts at the pointer handed to the application')
+    check('deviceMemoryInfo.guestCacheMappedOffset = offset;' in map_func,
+          'CMap/CUnmap record the map offset')
+    check('deviceMemoryInfo.guestCacheMappedSize = size;' in map_func,
+          'CMap/CUnmap record the map size')
+    check('deviceMemoryInfo.guestCacheMappedLimit = guestCacheLimit;' in map_func,
+          'CMap/CUnmap record the clamp limit')
+    check('guestCacheMaintainMappedAllocation(memory, offset, size, guestCacheLimit,' in map_func,
+          'CMap invalidates before vkMapMemory returns the pointer')
+    check('/*invalidate=*/true' in map_func, 'CMap uses civac (clean+invalidate)')
+
+    unmap_func = function_region(rt_cpp, 'void ResourceTracker::on_vkUnmapMemory(')
+    check(first_statement(unmap_func) ==
+          'if (!(guestCacheMaintenanceMode() & kGuestCacheModeCUnmap)) return;',
+          'CUnmap gate is the first statement (no state touched when off)')
+    check('if (!memoryInfo.guestCacheMapped) return;' in unmap_func,
+          'CUnmap only acts on an allocation that actually went through vkMapMemory')
+    check('memoryInfo.guestCacheMapped = false;' in unmap_func,
+          'CUnmap clears the recorded range after one use')
+    check('guestCacheMaintainMappedAllocation(memory, memoryInfo.guestCacheMappedOffset,' in unmap_func,
+          'CUnmap maintains the range recorded at map time')
+    check('/*invalidate=*/false' in unmap_func, 'CUnmap uses cvac (clean only)')
+
+    helper = function_region(rt_cpp,
+                             'void ResourceTracker::guestCacheMaintainMappedAllocation(')
+    check('std::lock_guard<std::recursive_mutex> lock(mLock);' in helper,
+          'the mapped-range helper takes the tracker lock')
+    check('if (!memoryInfo.ptr) return;' in helper, 'the helper skips unmapped allocations')
+    check('(memProps.memoryTypes[memoryInfo.memoryTypeIndex].propertyFlags &\n'
+          '          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)' in helper,
+          'the helper skips non-host-visible allocations')
+    check('guestCacheRangeForMappedMemory(limit, offset, size)' in helper,
+          'the helper clamps offset/size against the map limit')
+    check('guestCacheCleanLine(memoryInfo.ptr + line)' in helper and
+          'guestCacheCleanAndInvalidateLine(memoryInfo.ptr + line)' in helper,
+          'the helper performs cvac or civac per line')
+    check('guestCacheSync();' in helper, 'the helper fences after real work')
+
+    setinfo = function_region(rt_cpp, 'void ResourceTracker::setDeviceMemoryInfo(')
+    check('info.guestCacheMapped = false;' in setinfo,
+          'a reused VkDeviceMemory handle cannot inherit a stale mapped range')
+
     # ------------------------------------------------------------- call sites
     check(rt_cpp.count('guestCacheInvalidateMappedCoherent();') == 4,
           'A2 called from vkWaitForFences (2 Linux exits + 1 fallback) and vkQueueWaitIdle (1)')
     check(rt_cpp.count('guestCacheMaintainMappedRanges(') == 1,
           'A1 implementation is the only definition, no stray callers')
+    check(rt_cpp.count('guestCacheMaintainMappedAllocation(') == 3,
+          'mapped-range helper has one definition and the CMap/CUnmap call sites')
     check(validation.count('guestCacheMaintainMappedRanges(') == 2,
           'A1 called from flush and invalidate only')
     check('/*invalidate=*/false' in validation, 'flush path cleans (cvac)')
@@ -190,8 +263,11 @@ def main():
     # ------------------------------------------------------------ model tests
     mode_cases = [
         (None, 0), ('', 0), ('0', 0), ('off', 0),
-        ('a1', 1), ('a2', 2),
-        ('1', 3), ('on', 3), ('all', 3), ('A1', 3), ('a12', 3), ('offf', 3),
+        ('a1', 1), ('a2', 2), ('cmap', 4), ('cunmap', 8),
+        ('cmap,cunmap', 12), ('cunmap,cmap', 12), ('a1,cmap', 5),
+        ('a1,a2,cmap,cunmap', 15), ('cmap,', 4), (',cunmap', 8),
+        ('1', 15), ('on', 15), ('all', 15),
+        ('A1', 15), ('a12', 15), ('offf', 15), ('bogus', 15), ('0,cmap', 15),
     ]
     for value, expected in mode_cases:
         check(model_mode(value) == expected,
@@ -204,6 +280,9 @@ def main():
         ('whole from last line', (4096, 4096 - 1, UINT64_MAX), (4032, 4096)),
         ('last line', (4096, 4096 - 64, 64), (4032, 4096)),
         ('zero allocation', (0, 0, UINT64_MAX), (0, 0)),
+        ('unresolved limit', (0, 0, 4096), (0, 0)),
+        ('map at an offset', (8192, 4096, 4096), (4096, 8192)),
+        ('whole from a map offset', (8192, 4096, UINT64_MAX), (4096, 8192)),
         ('offset at end', (4096, 4096, 1), (0, 0)),
         ('offset past end', (4096, 4097, 1), (0, 0)),
         ('offset is u64 max', (4096, UINT64_MAX, UINT64_MAX), (0, 0)),

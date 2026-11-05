@@ -6,7 +6,8 @@
  * pieces of the fix that are pure logic and can be wrong in ways the device
  * would only show as a stale screenshot:
  *
- *   - the environment switch (default off must mean off),
+ *   - the environment switch (default off must mean off; every mode and comma
+ *     combination parses to its own bits),
  *   - the range clamp (VK_WHOLE_SIZE, zero size, offset at/past the end, and
  *     offset + size overflowing).
  *
@@ -19,6 +20,11 @@
 
 using gfxstream::vk::GuestCacheRange;
 using gfxstream::vk::kGuestCacheLineSize;
+using gfxstream::vk::kGuestCacheModeA1;
+using gfxstream::vk::kGuestCacheModeA2;
+using gfxstream::vk::kGuestCacheModeAll;
+using gfxstream::vk::kGuestCacheModeCMap;
+using gfxstream::vk::kGuestCacheModeCUnmap;
 using gfxstream::vk::guestCacheModeFromEnvValue;
 using gfxstream::vk::guestCacheRangeForMappedMemory;
 
@@ -74,16 +80,30 @@ int main() {
     expectMode("", 0, "empty is off");
     expectMode("0", 0, "\"0\" is off");
     expectMode("off", 0, "\"off\" is off");
-    // A/B split.
-    expectMode("a1", gfxstream::vk::kGuestCacheModeA1, "\"a1\" selects A1 only");
-    expectMode("a2", gfxstream::vk::kGuestCacheModeA2, "\"a2\" selects A2 only");
-    // Anything else that is not off selects both, so a typo widens the
+    // Each mechanism has its own bit, so a device run can split them.
+    expectMode("a1", kGuestCacheModeA1, "\"a1\" selects A1 only");
+    expectMode("a2", kGuestCacheModeA2, "\"a2\" selects A2 only");
+    expectMode("cmap", kGuestCacheModeCMap, "\"cmap\" selects map-invalidate only");
+    expectMode("cunmap", kGuestCacheModeCUnmap, "\"cunmap\" selects unmap-clean only");
+    expectMode("cmap,cunmap", kGuestCacheModeCMap | kGuestCacheModeCUnmap,
+               "\"cmap,cunmap\" selects both mapping directions");
+    expectMode("cunmap,cmap", kGuestCacheModeCMap | kGuestCacheModeCUnmap,
+               "comma order does not matter");
+    expectMode("a1,cmap", kGuestCacheModeA1 | kGuestCacheModeCMap,
+               "a comma list mixes API and mapping modes");
+    expectMode("a1,a2,cmap,cunmap", kGuestCacheModeAll, "all four named modes");
+    expectMode("cmap,", kGuestCacheModeCMap, "a trailing comma is harmless");
+    expectMode(",cunmap", kGuestCacheModeCUnmap, "a leading comma is harmless");
+    // Anything else that is not off selects everything, so a typo widens the
     // diagnostic instead of silently disabling the fix.
-    expectMode("1", 3, "\"1\" selects A1+A2");
-    expectMode("on", 3, "\"on\" selects A1+A2");
-    expectMode("all", 3, "\"all\" selects A1+A2");
-    expectMode("A1", 3, "an unknown value selects A1+A2 (fail open)");
-    expectMode("offf", 3, "a near-miss of off selects A1+A2 (fail open)");
+    expectMode("1", kGuestCacheModeAll, "\"1\" selects everything");
+    expectMode("on", kGuestCacheModeAll, "\"on\" selects everything");
+    expectMode("all", kGuestCacheModeAll, "\"all\" selects everything");
+    expectMode("A1", kGuestCacheModeAll, "an unknown value selects everything (fail open)");
+    expectMode("offf", kGuestCacheModeAll, "a near-miss of off selects everything (fail open)");
+    expectMode("bogus", kGuestCacheModeAll, "an unknown token selects everything (fail open)");
+    expectMode("0,cmap", kGuestCacheModeAll,
+               "a stray off token cannot silently narrow an explicit list");
 
     // Range math: clamped to the allocation, rounded out to whole lines.
     expectRange(4096, 0, 0, 0, 0, "zero size maintains nothing");
@@ -92,6 +112,9 @@ int main() {
     expectRange(4096, 4095, UINT64_MAX, 4032, 4096, "VK_WHOLE_SIZE from the last byte");
     expectRange(4096, 4096 - 64, 64, 4032, 4096, "last full line");
     expectRange(0, 0, UINT64_MAX, 0, 0, "zero allocation maintains nothing");
+    expectRange(0, 0, 4096, 0, 0, "an unresolved limit maintains nothing");
+    expectRange(8192, 4096, 4096, 4096, 8192, "a map at an offset is bounded by the allocation");
+    expectRange(8192, 4096, UINT64_MAX, 4096, 8192, "VK_WHOLE_SIZE from a map offset");
     expectRange(4096, 4096, 1, 0, 0, "offset at the end is empty");
     expectRange(4096, 4097, 1, 0, 0, "offset past the end is empty");
     expectRange(4096, UINT64_MAX, UINT64_MAX, 0, 0, "offset at UINT64_MAX is empty");
