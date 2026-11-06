@@ -1,0 +1,97 @@
+name: Mesa Wayland Zink no-DRM A-B
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container: ubuntu:26.04
+    timeout-minutes: 60
+    steps:
+      - name: Install native build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential git ca-certificates meson ninja-build pkg-config cmake \
+            python3-mako python3-yaml python3-packaging bison flex glslang-tools \
+            libdrm-dev libwayland-dev libwayland-egl-backend-dev wayland-protocols \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxdamage-dev \
+            libxshmfence-dev libxxf86vm-dev libxrandr-dev libxcb1-dev \
+            libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev libxcb-randr0-dev \
+            libxcb-shm0-dev libxcb-xfixes0-dev libxcb-glx0-dev libxcb-dri2-0-dev \
+            libexpat1-dev zlib1g-dev libvulkan-dev libudev-dev libglvnd-dev \
+            libzstd-dev zstd
+      - name: Fetch fixed Mesa source
+        run: |
+          set -eu
+          git init mesa
+          git -C mesa remote add origin https://github.com/taowen/mesa.git
+          git -C mesa fetch --depth 1 origin 98f3d6229d61452cef80f8563af7c56ae599dc14
+          git -C mesa checkout --detach FETCH_HEAD
+          test "$(git -C mesa rev-parse HEAD)" = 98f3d6229d61452cef80f8563af7c56ae599dc14
+      - name: Build matched baseline
+        run: |
+          set -eu
+          meson setup mesa/build mesa --buildtype=release --prefix=/usr --libdir=lib \
+            -Dplatforms=x11,wayland -Dgallium-drivers=zink,softpipe \
+            -Dvulkan-drivers= -Dllvm=disabled -Dopengl=true -Dgles1=disabled \
+            -Dgles2=enabled -Dgbm=enabled -Dglx=dri -Degl=enabled -Dglvnd=enabled \
+            -Dgallium-va=disabled -Dbuild-tests=false
+          ninja -C mesa/build -j4
+          DESTDIR="$PWD/stage/baseline" meson install -C mesa/build
+      - name: Apply only the two Wayland initialization conditions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('mesa/src/egl/drivers/dri2/platform_wayland.c')
+          text = p.read_text()
+          old = 'if (!dri2_setup_device(disp, disp->Options.ForceSoftware)) {'
+          new = 'if (!dri2_setup_device(disp, disp->Options.ForceSoftware || disp->Options.Zink)) {'
+          assert text.count(old) == 1
+          text = text.replace(old, new)
+          old = 'dri2_initialize_wayland(_EGLDisplay *disp)\n{\n   if (disp->Options.ForceSoftware)'
+          new = 'dri2_initialize_wayland(_EGLDisplay *disp)\n{\n   if (disp->Options.ForceSoftware || disp->Options.Zink)'
+          assert text.count(old) == 1
+          p.write_text(text.replace(old, new))
+          PY
+          git -C mesa diff --check
+          git -C mesa diff > mesa-egl-nodrm.patch
+          ninja -C mesa/build -j4
+          DESTDIR="$PWD/stage/candidate" meson install -C mesa/build
+      - name: Verify and package both library sets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p stage/build-info
+          git -C mesa rev-parse HEAD > stage/build-info/source-revision.txt
+          cp mesa-egl-nodrm.patch stage/build-info/
+          cp mesa/build/meson-info/intro-buildoptions.json stage/build-info/
+          dpkg-query -W > stage/build-info/build-packages.txt
+          for mode in baseline candidate; do
+            lib="stage/$mode/usr/lib"
+            test -f "$lib/libEGL_mesa.so.0"
+            readelf -h "$lib/libEGL_mesa.so.0" | grep 'Machine:.*AArch64'
+            readelf -d "$lib/libEGL_mesa.so.0" > "stage/build-info/$mode-egl-dynamic.txt"
+            find "$lib" -name 'libgallium*.so' -type f -print -quit | grep .
+            if ldd "$lib/libEGL_mesa.so.0" | grep 'not found'; then
+              LD_LIBRARY_PATH="$PWD/$lib" ldd "$lib/libEGL_mesa.so.0" > "stage/build-info/$mode-ldd.txt"
+              ! grep 'not found' "stage/build-info/$mode-ldd.txt"
+            fi
+          done
+          tar --zstd -cf mesa-egl-nodrm-ab-aarch64.tar.zst -C stage .
+          sha256sum mesa-egl-nodrm-ab-aarch64.tar.zst > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesa-egl-nodrm-ab-aarch64
+          path: |
+            mesa-egl-nodrm-ab-aarch64.tar.zst
+            SHA256SUMS
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mesa-build-logs
+          path: mesa/build/meson-logs/
