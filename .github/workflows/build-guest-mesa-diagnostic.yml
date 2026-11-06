@@ -1,4 +1,4 @@
-name: Mesa Kopper Wayland retirement A-B
+name: MaliBridge Wayland format capacity A-B (client only)
 on:
   workflow_dispatch:
 permissions:
@@ -7,98 +7,94 @@ jobs:
   build:
     runs-on: ubuntu-24.04-arm
     container: ubuntu:26.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install native build dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential git ca-certificates meson ninja-build pkg-config cmake \
-            python3-mako python3-yaml python3-packaging bison flex glslang-tools \
-            libdrm-dev libwayland-dev libwayland-egl-backend-dev wayland-protocols \
-            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxdamage-dev \
-            libxshmfence-dev libxxf86vm-dev libxrandr-dev libxcb1-dev \
-            libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev libxcb-randr0-dev \
-            libxcb-shm0-dev libxcb-xfixes0-dev libxcb-glx0-dev libxcb-dri2-0-dev \
-            libexpat1-dev zlib1g-dev libvulkan-dev libudev-dev libglvnd-dev \
-            libzstd-dev zstd
-      - name: Fetch fixed Mesa source
-        run: |
-          set -eu
-          git init mesa
-          git -C mesa remote add origin https://github.com/taowen/mesa.git
-          git -C mesa fetch --depth 1 origin 98f3d6229d61452cef80f8563af7c56ae599dc14
-          git -C mesa checkout --detach FETCH_HEAD
-          test "$(git -C mesa rev-parse HEAD)" = 98f3d6229d61452cef80f8563af7c56ae599dc14
-      - name: Configure pinned no-DRM trace build
-        run: |
-          set -eu
-          meson setup mesa/build mesa --buildtype=release --prefix=/usr --libdir=lib \
-            -Dplatforms=x11,wayland -Dgallium-drivers=zink,softpipe \
-            -Dvulkan-drivers= -Dllvm=disabled -Dopengl=true -Dgles1=disabled \
-            -Dgles2=enabled -Dgbm=enabled -Dglx=dri -Degl=enabled -Dglvnd=enabled \
-            -Dgallium-va=disabled -Dbuild-tests=false
-      - name: Apply no-DRM selection and lifecycle diagnostics
+    timeout-minutes: 30
+    defaults:
+      run:
         shell: bash
+    env:
+      MB_REVISION: 47ec18eaa9d9f83c359d56ba412a17d61ba59a66
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install native client build dependencies
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('mesa/src/egl/drivers/dri2/platform_wayland.c')
-          text = p.read_text()
-          old = 'if (!dri2_setup_device(disp, disp->Options.ForceSoftware)) {'
-          new = 'if (!dri2_setup_device(disp, disp->Options.ForceSoftware || disp->Options.Zink)) {'
-          assert text.count(old) == 1
-          text = text.replace(old, new)
-          old = 'dri2_initialize_wayland(_EGLDisplay *disp)\n{\n   if (disp->Options.ForceSoftware)'
-          new = 'dri2_initialize_wayland(_EGLDisplay *disp)\n{\n   if (disp->Options.ForceSoftware || disp->Options.Zink)'
-          assert text.count(old) == 1
-          p.write_text(text.replace(old, new))
-          PY
-          python3 diagnostics/mesa-kopper-lifecycle-patch.py mesa
-          git -C mesa diff --check
-          git -C mesa diff > mesa-egl-nodrm.patch
-          ninja -C mesa/build -j4
-          DESTDIR="$PWD/stage/candidate" meson install -C mesa/build
-          mv stage/candidate stage/baseline
-          cp mesa-egl-nodrm.patch mesa-before-retire.patch
-          python3 diagnostics/mesa-kopper-retire-patch.py mesa
-          git -C mesa diff --check
-          git -C mesa diff > mesa-kopper-retire.patch
-          ninja -C mesa/build -j4
-          DESTDIR="$PWD/stage/candidate" meson install -C mesa/build
-      - name: Verify and package baseline and retirement candidate
-        shell: bash
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git ca-certificates python3 \
+            libxcb1-dev libx11-dev libwayland-dev binutils zstd
+          test "$(uname -m)" = aarch64
+      - name: Fetch exact upstream source
+        run: |
+          set -euo pipefail
+          git init malibridge
+          git -C malibridge remote add origin https://github.com/ASEbrahim/MaliBridge.git
+          git -C malibridge fetch --depth 1 origin "$MB_REVISION"
+          git -C malibridge checkout --detach FETCH_HEAD
+          test "$(git -C malibridge rev-parse HEAD)" = "$MB_REVISION"
+          test "$(git -C malibridge rev-parse HEAD:third_party/Vulkan-Headers-1.4.341)" = 5cc90b8046cbfbd4638e0c2d0397938dab41a4ce
+          test -f malibridge/third_party/Vulkan-Headers-1.4.341/include/vulkan/vulkan.h
+          test -f malibridge/common/gen/vkb_gen_client.c
+          python3 -I diagnostics/malibridge-format-capacity-patch.py --check malibridge
+      - name: Build baseline and isolated candidate using upstream target
         run: |
           set -euo pipefail
           mkdir -p stage/build-info
-          git -C mesa rev-parse HEAD > stage/build-info/source-revision.txt
-          cp mesa-before-retire.patch mesa-kopper-retire.patch stage/build-info/
-          cp mesa/build/meson-info/intro-buildoptions.json stage/build-info/
           dpkg-query -W > stage/build-info/build-packages.txt
+          git -C malibridge rev-parse HEAD > stage/build-info/source-revision.txt
+          git -C malibridge ls-tree HEAD client/wsi_wayland.c client/wsi.c CMakeLists.txt \
+            common/gen/vkb_gen_client.c third_party/Vulkan-Headers-1.4.341 \
+            > stage/build-info/source-blobs.txt
+          cmake -S malibridge -B mb-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DBUILD_VARIANT=linux-aarch64
+          cp mb-build/CMakeCache.txt stage/build-info/
           for mode in baseline candidate; do
-            lib="stage/$mode/usr/lib"
-            test -f "$lib/libEGL_mesa.so.0"
-            readelf -h "$lib/libEGL_mesa.so.0" | grep 'Machine:.*AArch64'
-            readelf -d "$lib/libEGL_mesa.so.0" > "stage/build-info/$mode-egl-dynamic.txt"
-            find "$lib" -name 'libgallium*.so' -type f -print -quit | grep .
-            if ldd "$lib/libEGL_mesa.so.0" | grep 'not found'; then
-              LD_LIBRARY_PATH="$PWD/$lib" ldd "$lib/libEGL_mesa.so.0" > "stage/build-info/$mode-ldd.txt"
-              ! grep 'not found' "stage/build-info/$mode-ldd.txt"
+            if [ "$mode" = candidate ]; then
+              python3 -I diagnostics/malibridge-format-capacity-patch.py malibridge \
+                | tee stage/build-info/patch-input-fingerprints.txt
+              python3 -I diagnostics/malibridge-format-capacity-patch.py --verify-candidate malibridge
+              git -C malibridge diff --check
+              git -C malibridge diff > stage/build-info/format-capacity.patch
             fi
+            # Do not build default/all targets or run upstream's global install rules.
+            cmake --build mb-build --target vulkan_droidbridge --parallel 4 \
+              | tee "stage/build-info/$mode-build.log"
+            mkdir -p "stage/$mode/lib" "stage/$mode/share/vulkan/icd.d"
+            cp mb-build/libvulkan_droidbridge.so "stage/$mode/lib/"
+            MODE="$mode" python3 -I - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path('stage') / os.environ['MODE'] / 'share/vulkan/icd.d/droidbridge_icd.json'
+          p.write_text(json.dumps({'file_format_version': '1.0.0', 'ICD': {
+              'library_path': '../../../lib/libvulkan_droidbridge.so',
+              'api_version': '1.4.341'}}, indent=2) + '\n')
+          PY
+            lib="stage/$mode/lib/libvulkan_droidbridge.so"
+            readelf -h "$lib" | tee "stage/build-info/$mode-elf.txt" | grep 'Machine:.*AArch64'
+            readelf -d "$lib" > "stage/build-info/$mode-dynamic.txt"
+            readelf --version-info "$lib" > "stage/build-info/$mode-symbol-versions.txt"
+            ldd "$lib" > "stage/build-info/$mode-ldd.txt"
+            ! grep 'not found' "stage/build-info/$mode-ldd.txt"
+            sha256sum "$lib" > "stage/build-info/$mode-SHA256SUMS"
           done
-          tar --zstd -cf mesa-kopper-lifecycle-aarch64.tar.zst -C stage .
-          sha256sum mesa-kopper-lifecycle-aarch64.tar.zst > SHA256SUMS
-      - uses: actions/upload-artifact@v4
+          cmp -s stage/baseline/lib/libvulkan_droidbridge.so stage/candidate/lib/libvulkan_droidbridge.so && exit 1
+          strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'dma-buf modifier table full' > stage/build-info/candidate-marker.txt
+          cp diagnostics/malibridge-format-capacity-patch.py stage/build-info/
+          ! find stage -type f -name '*server*.so' | grep .
+          tar --zstd -cf malibridge-format-capacity-aarch64.tar.zst -C stage .
+          sha256sum malibridge-format-capacity-aarch64.tar.zst > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: mesa-kopper-lifecycle-aarch64
+          name: malibridge-format-capacity-aarch64
           path: |
-            mesa-kopper-lifecycle-aarch64.tar.zst
+            malibridge-format-capacity-aarch64.tar.zst
             SHA256SUMS
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
-          name: mesa-build-logs
-          path: mesa/build/meson-logs/
+          name: malibridge-format-capacity-build-logs
+          path: |
+            stage/build-info/
+            mb-build/CMakeFiles/CMakeConfigureLog.yaml
+            mb-build/CMakeCache.txt
