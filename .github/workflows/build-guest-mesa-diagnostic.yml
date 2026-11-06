@@ -1,4 +1,4 @@
-name: Mesa Kopper Wayland lifecycle diagnostics
+name: Mesa Kopper Wayland retirement A-B
 on:
   workflow_dispatch:
 permissions:
@@ -61,16 +61,23 @@ jobs:
           git -C mesa diff > mesa-egl-nodrm.patch
           ninja -C mesa/build -j4
           DESTDIR="$PWD/stage/candidate" meson install -C mesa/build
-      - name: Verify and package both library sets
+          mv stage/candidate stage/baseline
+          cp mesa-egl-nodrm.patch mesa-before-retire.patch
+          python3 diagnostics/mesa-kopper-retire-patch.py mesa
+          git -C mesa diff --check
+          git -C mesa diff > mesa-kopper-retire.patch
+          ninja -C mesa/build -j4
+          DESTDIR="$PWD/stage/candidate" meson install -C mesa/build
+      - name: Verify and package baseline and retirement candidate
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p stage/build-info
           git -C mesa rev-parse HEAD > stage/build-info/source-revision.txt
-          cp mesa-egl-nodrm.patch stage/build-info/
+          cp mesa-before-retire.patch mesa-kopper-retire.patch stage/build-info/
           cp mesa/build/meson-info/intro-buildoptions.json stage/build-info/
           dpkg-query -W > stage/build-info/build-packages.txt
-          for mode in candidate; do
+          for mode in baseline candidate; do
             lib="stage/$mode/usr/lib"
             test -f "$lib/libEGL_mesa.so.0"
             readelf -h "$lib/libEGL_mesa.so.0" | grep 'Machine:.*AArch64'
