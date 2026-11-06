@@ -1,4 +1,4 @@
-name: Mesa Wayland Zink no-DRM A-B
+name: Mesa Kopper Wayland lifecycle diagnostics
 on:
   workflow_dispatch:
 permissions:
@@ -9,6 +9,7 @@ jobs:
     container: ubuntu:26.04
     timeout-minutes: 60
     steps:
+      - uses: actions/checkout@v4
       - name: Install native build dependencies
         run: |
           apt-get update
@@ -30,7 +31,7 @@ jobs:
           git -C mesa fetch --depth 1 origin 98f3d6229d61452cef80f8563af7c56ae599dc14
           git -C mesa checkout --detach FETCH_HEAD
           test "$(git -C mesa rev-parse HEAD)" = 98f3d6229d61452cef80f8563af7c56ae599dc14
-      - name: Build matched baseline
+      - name: Configure pinned no-DRM trace build
         run: |
           set -eu
           meson setup mesa/build mesa --buildtype=release --prefix=/usr --libdir=lib \
@@ -38,9 +39,7 @@ jobs:
             -Dvulkan-drivers= -Dllvm=disabled -Dopengl=true -Dgles1=disabled \
             -Dgles2=enabled -Dgbm=enabled -Dglx=dri -Degl=enabled -Dglvnd=enabled \
             -Dgallium-va=disabled -Dbuild-tests=false
-          ninja -C mesa/build -j4
-          DESTDIR="$PWD/stage/baseline" meson install -C mesa/build
-      - name: Apply only the two Wayland initialization conditions
+      - name: Apply no-DRM selection and lifecycle diagnostics
         shell: bash
         run: |
           set -euo pipefail
@@ -57,6 +56,7 @@ jobs:
           assert text.count(old) == 1
           p.write_text(text.replace(old, new))
           PY
+          python3 diagnostics/mesa-kopper-lifecycle-patch.py mesa
           git -C mesa diff --check
           git -C mesa diff > mesa-egl-nodrm.patch
           ninja -C mesa/build -j4
@@ -70,7 +70,7 @@ jobs:
           cp mesa-egl-nodrm.patch stage/build-info/
           cp mesa/build/meson-info/intro-buildoptions.json stage/build-info/
           dpkg-query -W > stage/build-info/build-packages.txt
-          for mode in baseline candidate; do
+          for mode in candidate; do
             lib="stage/$mode/usr/lib"
             test -f "$lib/libEGL_mesa.so.0"
             readelf -h "$lib/libEGL_mesa.so.0" | grep 'Machine:.*AArch64'
@@ -81,13 +81,13 @@ jobs:
               ! grep 'not found' "stage/build-info/$mode-ldd.txt"
             fi
           done
-          tar --zstd -cf mesa-egl-nodrm-ab-aarch64.tar.zst -C stage .
-          sha256sum mesa-egl-nodrm-ab-aarch64.tar.zst > SHA256SUMS
+          tar --zstd -cf mesa-kopper-lifecycle-aarch64.tar.zst -C stage .
+          sha256sum mesa-kopper-lifecycle-aarch64.tar.zst > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: mesa-egl-nodrm-ab-aarch64
+          name: mesa-kopper-lifecycle-aarch64
           path: |
-            mesa-egl-nodrm-ab-aarch64.tar.zst
+            mesa-kopper-lifecycle-aarch64.tar.zst
             SHA256SUMS
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
