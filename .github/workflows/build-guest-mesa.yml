@@ -1,215 +1,97 @@
-# Cross-build the guest mesa .deb from Droid-VM/mesa and publish it as a GitHub release.
-#
-# Manual only, and TWO independent choices of branch:
-#
-#   "Use workflow from"   which mesa-cross ref provides the recipe (this file, build.sh,
-#                         mesa-config.sh). Any branch or tag of this repo.
-#   `branch` input        which Droid-VM/mesa BRANCH to build. Left empty it follows the ref
-#                         above, the same rule the meta repo applies to its own branch
-#                         (mesa-config.sh: mesa_branch).
-#
-# So a second line of work needs nothing added here. Either make a mesa-cross branch with the same
-# name and select it, or stay on wip/3d-accel and type the mesa branch in the `branch` box. Both
-# build the same thing; the first also lets the recipe itself differ per line.
-#
-# ONE build, ONE .deb. Until 2026-08-18 this ran three jobs in parallel, one per route, because
-# the routes lived on three mesa branches sitting on unrelated upstream commits. They now share a
-# branch and a binary: -Dvulkan-drivers=gfxstream,freedreno,virtio, with the route chosen at run
-# time by which ICD enumerates a device.
-#
-# The requested branch is checked for existence before anything is built, so a typo or a branch
-# that has not been pushed yet fails in seconds with the list of branches that DO exist -- not
-# twenty minutes into a container build.
-name: guest mesa
-
+name: Mesa Wayland Zink no-DRM A-B
 on:
   workflow_dispatch:
-    inputs:
-      branch:
-        description: 'Droid-VM/mesa branch to build, e.g. wip/3d-accel. Empty = the ref this workflow runs from.'
-        required: false
-        default: ''
-      mesa_repo:
-        description: 'mesa repository (owner/name)'
-        required: false
-        default: 'Droid-VM/mesa'
-      release:
-        description: 'publish a release (off = artifact only)'
-        type: boolean
-        default: true
-      tag:
-        description: 'release tag. Empty = the branch name with / replaced by _ . An existing tag is updated in place.'
-        required: false
-        default: ''
-      prerelease:
-        description: 'mark the release as a pre-release'
-        type: boolean
-        default: true
-      refresh_env:
-        description: 'rebuild the cross environment image from scratch (ignore the layer cache)'
-        type: boolean
-        default: false
-
 permissions:
-  contents: write
-
+  contents: read
 jobs:
   build:
-    runs-on: ubuntu-latest
-    outputs:
-      branch: ${{ steps.plan.outputs.branch }}
-      tag: ${{ steps.plan.outputs.tag }}
+    runs-on: ubuntu-24.04-arm
+    container: ubuntu:26.04
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-
-      - id: plan
-        env:
-          IN_BRANCH: ${{ inputs.branch }}
-          IN_TAG: ${{ inputs.tag }}
-          MESA_REPO: ${{ inputs.mesa_repo }}
-          REF_NAME: ${{ github.ref_name }}
+      - name: Install native build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential git ca-certificates meson ninja-build pkg-config cmake \
+            python3-mako python3-yaml python3-packaging bison flex glslang-tools \
+            libdrm-dev libwayland-dev libwayland-egl-backend-dev wayland-protocols \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxdamage-dev \
+            libxshmfence-dev libxxf86vm-dev libxrandr-dev libxcb1-dev \
+            libxcb-dri3-dev libxcb-present-dev libxcb-sync-dev libxcb-randr0-dev \
+            libxcb-shm0-dev libxcb-xfixes0-dev libxcb-glx0-dev libxcb-dri2-0-dev \
+            libexpat1-dev zlib1g-dev libvulkan-dev libudev-dev libglvnd-dev \
+            libzstd-dev zstd
+      - name: Fetch fixed Mesa source
+        run: |
+          set -eu
+          git init mesa
+          git -C mesa remote add origin https://github.com/taowen/mesa.git
+          git -C mesa fetch --depth 1 origin 98f3d6229d61452cef80f8563af7c56ae599dc14
+          git -C mesa checkout --detach FETCH_HEAD
+          test "$(git -C mesa rev-parse HEAD)" = 98f3d6229d61452cef80f8563af7c56ae599dc14
+      - name: Build matched baseline
+        run: |
+          set -eu
+          meson setup mesa/build mesa --buildtype=release --prefix=/usr --libdir=lib \
+            -Dplatforms=x11,wayland -Dgallium-drivers=zink,softpipe \
+            -Dvulkan-drivers= -Dllvm=disabled -Dopengl=true -Dgles1=disabled \
+            -Dgles2=enabled -Dgbm=enabled -Dglx=dri -Degl=enabled -Dglvnd=enabled \
+            -Dgallium-va=disabled -Dbuild-tests=false
+          ninja -C mesa/build -j4
+          DESTDIR="$PWD/stage/baseline" meson install -C mesa/build
+      - name: Apply only the two Wayland initialization conditions
+        shell: bash
         run: |
           set -euo pipefail
-          branch=${IN_BRANCH:-$REF_NAME}
-          # A variant suffix left over from before the routes merged would name a branch that no
-          # longer exists; strip it the way mesa_branch does.
-          branch=${branch%-gfxstream}; branch=${branch%-drm2kgsl}; branch=${branch%-kgsl}; branch=${branch%-venus}
-
-          # The tag IS the branch name. Git refuses a tag containing '/' when a branch of the same
-          # name exists (refs/tags/wip/3d-accel and refs/heads/wip/3d-accel cannot both be a
-          # directory and a file), so '/' becomes '_'. Re-running the workflow on a branch updates
-          # that one release rather than accumulating a release per run.
-          tag=${IN_TAG:-${branch//\//_}}
-          {
-            echo "branch=$branch"
-            echo "tag=$tag"
-          } >> "$GITHUB_OUTPUT"
-          echo "mesa branch: $branch  tag: $tag"
-
-          # The branch must exist on the mesa remote before we spend a runner on it. The
-          # informative failure is "that branch is not there, here is what is" rather than a clone
-          # error twenty minutes in. ls-remote needs no clone and no token for a public repo; a
-          # private mesa would need one added here.
-          url=https://github.com/$MESA_REPO.git
-          if ! have=$(git ls-remote --heads "$url" | sed 's#.*refs/heads/##'); then
-            echo "::error::cannot read $url -- wrong mesa_repo, or a private repo (this step uses no token)"
-            exit 1
-          fi
-          if ! grep -qx "$branch" <<<"$have"; then
-            echo "::error::$MESA_REPO has no branch '$branch'"
-            echo "::error::branches: $(echo "${have:-(none)}" | tr '\n' ' ' | sed 's/ $//')"
-            exit 1
-          fi
-
-      - uses: docker/setup-buildx-action@v3
-
-      # Same image build.sh makes locally, with the layers cached across runs. apt-get lives in a
-      # cached layer, so the arm64 -dev packages only move when the Dockerfile/sources change or
-      # `refresh_env` is set.
-      - name: cross environment image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.mesa-cross
-          tags: droidvm-mesa-cross:latest
-          load: true
-          no-cache: ${{ inputs.refresh_env }}
-          cache-from: type=gha,scope=mesa-cross-env
-          cache-to: type=gha,mode=max,scope=mesa-cross-env,ignore-error=true
-
-      - name: build
-        env:
-          MESA_NO_IMAGE_BUILD: '1'
-          MESA_URL: https://github.com/${{ inputs.mesa_repo }}.git
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('mesa/src/egl/drivers/dri2/platform_wayland.c')
+          text = p.read_text()
+          old = 'if (!dri2_setup_device(disp, disp->Options.ForceSoftware)) {'
+          new = 'if (!dri2_setup_device(disp, disp->Options.ForceSoftware || disp->Options.Zink)) {'
+          assert text.count(old) == 1
+          text = text.replace(old, new)
+          old = 'dri2_initialize_wayland(_EGLDisplay *disp)\n{\n   if (disp->Options.ForceSoftware)'
+          new = 'dri2_initialize_wayland(_EGLDisplay *disp)\n{\n   if (disp->Options.ForceSoftware || disp->Options.Zink)'
+          assert text.count(old) == 1
+          p.write_text(text.replace(old, new))
+          PY
+          git -C mesa diff --check
+          git -C mesa diff > mesa-egl-nodrm.patch
+          ninja -C mesa/build -j4
+          DESTDIR="$PWD/stage/candidate" meson install -C mesa/build
+      - name: Verify and package both library sets
+        shell: bash
         run: |
           set -euo pipefail
-          {
-            echo "| mesa branch | commit | package |"
-            echo "|---|---|---|"
-          } >> "$GITHUB_STEP_SUMMARY"
-          ./ci-build.sh "${{ steps.plan.outputs.branch }}" "$PWD/out"
-
+          mkdir -p stage/build-info
+          git -C mesa rev-parse HEAD > stage/build-info/source-revision.txt
+          cp mesa-egl-nodrm.patch stage/build-info/
+          cp mesa/build/meson-info/intro-buildoptions.json stage/build-info/
+          dpkg-query -W > stage/build-info/build-packages.txt
+          for mode in baseline candidate; do
+            lib="stage/$mode/usr/lib"
+            test -f "$lib/libEGL_mesa.so.0"
+            readelf -h "$lib/libEGL_mesa.so.0" | grep 'Machine:.*AArch64'
+            readelf -d "$lib/libEGL_mesa.so.0" > "stage/build-info/$mode-egl-dynamic.txt"
+            find "$lib" -name 'libgallium*.so' -type f -print -quit | grep .
+            if ldd "$lib/libEGL_mesa.so.0" | grep 'not found'; then
+              LD_LIBRARY_PATH="$PWD/$lib" ldd "$lib/libEGL_mesa.so.0" > "stage/build-info/$mode-ldd.txt"
+              ! grep 'not found' "stage/build-info/$mode-ldd.txt"
+            fi
+          done
+          tar --zstd -cf mesa-egl-nodrm-ab-aarch64.tar.zst -C stage .
+          sha256sum mesa-egl-nodrm-ab-aarch64.tar.zst > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: mesa-guest-deb
+          name: mesa-egl-nodrm-ab-aarch64
           path: |
-            out/*.deb
-            out/build.env
+            mesa-egl-nodrm-ab-aarch64.tar.zst
+            SHA256SUMS
           if-no-files-found: error
-
-  release:
-    needs: build
-    if: ${{ success() && inputs.release }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/upload-artifact@v4
+        if: failure()
         with:
-          name: mesa-guest-deb
-          path: dist
-
-      - name: release notes + checksum
-        env:
-          BRANCH: ${{ needs.build.outputs.branch }}
-          MESA_REPO: ${{ inputs.mesa_repo }}
-          RECIPE_SHA: ${{ github.sha }}
-          RECIPE_REF: ${{ github.ref_name }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          # shellcheck disable=SC1091
-          source dist/build.env
-          rm -f dist/build.env
-          # Same file lib_dist.sh writes next to the deb locally: scp into these guests has been
-          # seen to truncate silently, and `md5sum -c MD5SUMS` on the far side is the cheapest way
-          # to rule that out first.
-          ( cd dist && md5sum ./*.deb > MD5SUMS )
-          {
-            echo "Guest mesa for the DroidVM 3D-acceleration stack, cross-built for arm64 from \`$MESA_REPO\` branch \`$BRANCH\`."
-            echo
-            echo "| mesa branch | commit | package |"
-            echo "|---|---|---|"
-            printf '| `%s` | [`%s`](https://github.com/%s/commit/%s) | `%s` |\n' \
-                "$MESA_BRANCH" "${MESA_COMMIT:0:8}" "$MESA_REPO" "$MESA_COMMIT" "$DEB"
-            echo
-            echo "One package, all three routes -- gfxstream, venus and drm2kgsl. \`VK_DRIVER_FILES\` names"
-            echo "all three ICDs and the Vulkan loader keeps whichever one enumerates a device, which is the"
-            echo "one matching the virtio-gpu capset the VMM exposed. Installing it removes the old per-route"
-            echo "\`mesa-guest-*\` packages."
-            echo
-            echo '```'
-            echo 'sudo apt install ./mesa-guest_*_arm64.deb'
-            echo 'md5sum -c MD5SUMS   # after copying: scp into these guests has truncated silently before'
-            echo '```'
-            echo
-            echo "Recipe: mesa-cross \`$RECIPE_REF\` @ ${RECIPE_SHA:0:8} · [workflow run]($RUN_URL)"
-          } > body.md
-          cat body.md
-          ls -l dist
-
-      - name: publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.build.outputs.tag }}
-          TITLE: 'guest mesa ${{ needs.build.outputs.branch }} #${{ github.run_number }}'
-          PRERELEASE: ${{ inputs.prerelease }}
-          TARGET: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "updating existing release $TAG"
-            # The tag is the branch name, so this release is reused run after run -- but the .deb
-            # filename carries the version, and --clobber only replaces an asset of the SAME name.
-            # Without this, every previous run's .deb stays attached while MD5SUMS (same name, so
-            # it IS replaced) lists only the newest, and `apt install ./mesa-guest_*_arm64.deb`
-            # matches more than one file. Drop whatever this run is not about to upload.
-            gh release view "$TAG" --json assets -q '.assets[].name' | while read -r a; do
-              [ -e "dist/$a" ] || { echo "  removing stale asset $a"; gh release delete-asset "$TAG" "$a" -y; }
-            done
-            gh release edit "$TAG" --title "$TITLE" --notes-file body.md --prerelease="$PRERELEASE"
-            gh release upload "$TAG" --clobber dist/*
-          else
-            gh release create "$TAG" --target "$TARGET" --title "$TITLE" --notes-file body.md \
-              --prerelease="$PRERELEASE" dist/*
-          fi
-          gh release view "$TAG" --json url -q .url >> "$GITHUB_STEP_SUMMARY"
+          name: mesa-build-logs
+          path: mesa/build/meson-logs/
