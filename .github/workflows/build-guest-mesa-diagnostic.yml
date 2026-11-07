@@ -89,7 +89,9 @@ jobs:
             nm -D --defined-only "$lib" | awk '{print $2, $3}' | sort \
               > "stage/build-info/$mode-exports.txt"
             VKBRIDGE_SOCKET="$PWD/stage/no-socket" timeout 30 \
-              stage/build-info/wsi-smoke "$PWD/$lib" > "stage/build-info/$mode-smoke.txt" 2>&1
+              stage/build-info/wsi-smoke "$PWD/$lib" 2>&1 \
+              | sed -E 's/\[[A-Za-z0-9._-]+ [0-9]+\]/[process]/g' \
+              > "stage/build-info/$mode-smoke.txt"
             sha256sum "$lib" > "stage/build-info/$mode-SHA256SUMS"
           done
           cmp -s stage/baseline/lib/libvulkan_droidbridge.so stage/candidate/lib/libvulkan_droidbridge.so && exit 1
