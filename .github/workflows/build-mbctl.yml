@@ -135,12 +135,12 @@ jobs:
           cp diagnostics/start-independent.sh diagnostics/stop-independent.sh stage/server/
           chmod 755 stage/server/*.sh
           cat > stage/server/budget.conf.example <<'EOF'
-# Written by: mbctl set --persist
-total_mb=4096
-pid_mb=2048
-floor_mb=2048
-map_limit=60000
-EOF
+          # Written by: mbctl set --persist
+          total_mb=4096
+          pid_mb=2048
+          floor_mb=2048
+          map_limit=60000
+          EOF
       - name: Package
         run: |
           set -euo pipefail
