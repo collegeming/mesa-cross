@@ -13,5 +13,8 @@ VKBRIDGE_CONTROL_CONF="$D/budget.conf" VKBRIDGE_CONTROL_UIDS="${VKBRIDGE_CONTROL
   nohup sh -c "\"$BIN\" --socket \"$D/mali.sock\" --log \"$D/server.log\"" >"$D/stdout.log" 2>&1 &
 echo $! > "$D/server.pid"
 sleep 1
+chmod 666 "$D/mali.sock" 2>/dev/null || true
+P=$(pgrep -f "$BIN.*$D/mali.sock" | head -n1)
+[ -n "${P:-}" ] && echo 0 > "/proc/$P/oom_score_adj" 2>/dev/null
 ls -l "$D"/mali.sock "$D"/control.sock 2>/dev/null
 tail -3 "$D/server.log" 2>/dev/null
