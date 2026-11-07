@@ -17,8 +17,8 @@ jobs:
       - name: Install build dependencies
         run: |
           set -euo pipefail
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build git ca-certificates python3 curl unzip zstd \
             gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu
       - name: Fetch exact upstream source
