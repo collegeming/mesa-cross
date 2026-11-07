@@ -1,0 +1,952 @@
+diff --git a/server/server_control.c b/server/server_control.c
+new file mode 100644
+index 0000000..c632d8b
+--- /dev/null
++++ b/server/server_control.c
+@@ -0,0 +1,517 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
++ *
++ * The budget control socket (server_control.c).
++ *
++ * A second Unix socket beside the bridge's own, mode 0666, JSON lines, one reply per request:
++ *   {"cmd":"status"}
++ *   {"cmd":"set","total_mb":4096,"pid_mb":2048,"floor_mb":2048,"map_limit":60000,"persist":false}
++ * Every connection is checked with SO_PEERCRED: only the uids in VKBRIDGE_CONTROL_UIDS (default
++ * 1000) may ask. A line is at most 4096 bytes and only the keys below are accepted; anything else
++ * is answered with {"ok":false,...} and the connection closed. The thread serves the socket
++ * sequentially with a 2 s idle timeout, so a stuck client cannot wedge it. The budget itself is
++ * changed by server_memory.c under one lock; a lower limit does not kill a client, it only makes
++ * its later allocations fail with VK_ERROR_OUT_OF_DEVICE_MEMORY.
++ */
++#define _GNU_SOURCE
++#include "vkb_server.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++
++#ifndef PATH_MAX
++#define PATH_MAX 4096
++#endif
++
++#define CTL_LINE_MAX 4096
++#define CTL_OUT_MAX 8192
++#define CTL_UIDS_MAX 8
++#define CTL_IDLE_MS 2000
++
++static int ctl_fd = -1;
++static char ctl_path[PATH_MAX];
++static uid_t ctl_uids[CTL_UIDS_MAX];
++static int ctl_nuids;
++
++static int64_t ctl_now_ms(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
++static int ctl_send(int fd, const char *s, size_t n)
++{
++    while (n) {
++        ssize_t w = send(fd, s, n, MSG_NOSIGNAL);
++        if (w < 0 && errno == EINTR) continue;
++        if (w <= 0) return -1;
++        s += w;
++        n -= (size_t)w;
++    }
++    return 0;
++}
++
++static void ctl_escape(char *dst, size_t cap, const char *src)
++{
++    size_t o = 0;
++    if (!cap) return;
++    for (; src && *src && o + 7 < cap; src++) {
++        unsigned char c = (unsigned char)*src;
++        if (c == '"' || c == '\\') {
++            dst[o++] = '\\';
++            dst[o++] = (char)c;
++        } else if (c < 0x20) {
++            o += (size_t)snprintf(dst + o, cap - o, "\\u%04x", c);
++        } else {
++            dst[o++] = (char)c;
++        }
++    }
++    dst[o] = 0;
++}
++
++static int ctl_reply_error(int fd, const char *msg)
++{
++    char out[256];
++    int n = snprintf(out, sizeof(out), "{\"ok\":false,\"error\":\"%s\"}\n", msg);
++    return ctl_send(fd, out, (size_t)n);
++}
++
++static long ctl_rss_kb(void)
++{
++    char buf[4096];
++    int fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
++    if (fd < 0) return 0;
++    ssize_t k = read(fd, buf, sizeof(buf) - 1);
++    close(fd);
++    buf[k > 0 ? k : 0] = 0;
++    const char *p = strstr(buf, "VmRSS:");
++    return p ? strtol(p + 6, NULL, 10) : 0;
++}
++
++/* ------------------------------------------------------------------ request parsing */
++
++typedef struct {
++    int is_set;
++    int has_total, has_pid, has_floor, has_map, has_persist;
++    int64_t total_mb, pid_mb, floor_mb, map_limit;
++    int persist;
++} ctl_req;
++
++static const char *ctl_ws(const char *p, const char *e)
++{
++    while (p < e && (*p == ' ' || *p == '\t')) p++;
++    return p;
++}
++
++static int ctl_string(const char **pp, const char *e, char *out, size_t cap)
++{
++    const char *p = *pp;
++    size_t n = 0;
++    if (p >= e || *p != '"') return -1;
++    for (p++; p < e && *p != '"'; p++) {
++        unsigned char c = (unsigned char)*p;
++        if (c < 0x20) return -1;
++        if (c == '\\') {
++            if (++p >= e) return -1;
++            switch (*p) {
++            case '"': c = '"'; break;
++            case '\\': c = '\\'; break;
++            case '/': c = '/'; break;
++            case 'n': c = '\n'; break;
++            case 't': c = '\t'; break;
++            case 'r': c = '\r'; break;
++            case 'b': c = '\b'; break;
++            case 'f': c = '\f'; break;
++            default: return -1;
++            }
++        }
++        if (n + 1 >= cap) return -1;
++        out[n++] = (char)c;
++    }
++    if (p >= e || *p != '"') return -1;
++    out[n] = 0;
++    *pp = p + 1;
++    return 0;
++}
++
++static int ctl_int(const char **pp, const char *e, int64_t *out)
++{
++    const char *p = *pp;
++    int neg = 0;
++    int64_t v = 0;
++    if (p < e && *p == '-') neg = 1, p++;
++    if (p >= e || *p < '0' || *p > '9') return -1;
++    while (p < e && *p >= '0' && *p <= '9') {
++        int d = *p - '0';
++        if (v > (INT64_MAX - d) / 10) return -1;
++        v = v * 10 + d;
++        p++;
++    }
++    *out = neg ? -v : v;
++    *pp = p;
++    return 0;
++}
++
++static int ctl_lit(const char **pp, const char *e, const char *lit)
++{
++    size_t n = strlen(lit);
++    if ((size_t)(e - *pp) < n || memcmp(*pp, lit, n)) return -1;
++    *pp += n;
++    return 0;
++}
++
++static int ctl_parse(const char *line, size_t len, ctl_req *r, char *err, size_t err_len)
++{
++    const char *p = line, *e = line + len;
++    int seen = 0;
++    memset(r, 0, sizeof(*r));
++    p = ctl_ws(p, e);
++    if (p >= e || *p != '{') goto bad;
++    p = ctl_ws(p + 1, e);
++    if (p < e && *p == '}') {
++        p++;
++        goto end;
++    }
++    for (;;) {
++        char key[32];
++        p = ctl_ws(p, e);
++        if (ctl_string(&p, e, key, sizeof(key))) goto bad;
++        p = ctl_ws(p, e);
++        if (p >= e || *p != ':') goto bad;
++        p = ctl_ws(p + 1, e);
++        if (!strcmp(key, "cmd")) {
++            char v[16];
++            if (seen & 1) goto bad;
++            seen |= 1;
++            if (ctl_string(&p, e, v, sizeof(v))) goto bad;
++            if (!strcmp(v, "status")) r->is_set = 0;
++            else if (!strcmp(v, "set")) r->is_set = 1;
++            else goto bad;
++        } else if (!strcmp(key, "total_mb") || !strcmp(key, "pid_mb") || !strcmp(key, "floor_mb") || !strcmp(key, "map_limit")) {
++            int64_t *dst = !strcmp(key, "total_mb") ? &r->total_mb : !strcmp(key, "pid_mb") ? &r->pid_mb : !strcmp(key, "floor_mb") ? &r->floor_mb : &r->map_limit;
++            int bit = !strcmp(key, "total_mb") ? 2 : !strcmp(key, "pid_mb") ? 4 : !strcmp(key, "floor_mb") ? 8 : 16;
++            if (seen & (1 << bit)) goto bad;
++            seen |= 1 << bit;
++            if (ctl_int(&p, e, dst)) goto bad;
++            if (bit == 2) r->has_total = 1;
++            else if (bit == 4) r->has_pid = 1;
++            else if (bit == 8) r->has_floor = 1;
++            else r->has_map = 1;
++        } else if (!strcmp(key, "persist")) {
++            if (seen & 32) goto bad;
++            seen |= 32;
++            if (!ctl_lit(&p, e, "true")) r->persist = 1;
++            else if (!ctl_lit(&p, e, "false")) r->persist = 0;
++            else goto bad;
++            r->has_persist = 1;
++        } else {
++            goto bad; /* unknown key */
++        }
++        p = ctl_ws(p, e);
++        if (p < e && *p == ',') {
++            p++;
++            continue;
++        }
++        if (p < e && *p == '}') {
++            p++;
++            break;
++        }
++        goto bad;
++    }
++end:
++    p = ctl_ws(p, e);
++    if (p != e) goto bad;
++    if (!(seen & 1)) goto bad;
++    if (!r->is_set && seen != 1) goto bad; /* status takes no other key */
++    if (r->is_set && !(r->has_total || r->has_pid || r->has_floor || r->has_map)) goto bad;
++    return 0;
++bad:
++    if (err && err_len) snprintf(err, err_len, "bad request");
++    return -1;
++}
++
++/* ------------------------------------------------------------------ commands */
++
++static int ctl_status(char *out, size_t cap)
++{
++    vkb_mem_budget_cfg cfg;
++    vkb_mem_budget_client clients[VKB_MEM_BUDGET_CLIENTS];
++    int count = 0, n = 0;
++    int64_t total = 0;
++    vkb_mem_budget_get(&cfg);
++    vkb_mem_budget_usage(clients, VKB_MEM_BUDGET_CLIENTS, &count, &total);
++    unsigned long long avail = (unsigned long long)vkb_memavail_kb();
++    long long maps = (long long)vkb_mem_budget_maps();
++    long rss = ctl_rss_kb();
++#define APP(...)                                                                                                                      \
++    do {                                                                                                                              \
++        if (n < 0 || (size_t)n >= cap) goto overflow;                                                                                 \
++        int w_ = snprintf(out + n, cap - (size_t)n, __VA_ARGS__);                                                                     \
++        if (w_ < 0 || (size_t)w_ >= cap - (size_t)n) goto overflow;                                                                   \
++        n += w_;                                                                                                                      \
++    } while (0)
++    APP("{\"ok\":true,\"budget\":{\"total_mb\":%lld,\"pid_mb\":%lld,\"floor_mb\":%lld,\"map_limit\":%lld},"
++        "\"usage\":{\"total_bytes\":%lld,\"clients\":[",
++        (long long)cfg.total_mb, (long long)cfg.pid_mb, (long long)cfg.floor_mb, (long long)cfg.map_limit, (long long)total);
++    for (int i = 0; i < count && i < VKB_MEM_BUDGET_CLIENTS; i++)
++        APP("%s{\"pid\":%d,\"bytes\":%lld}", i ? "," : "", clients[i].pid, (long long)clients[i].bytes);
++    APP("]},\"system\":{\"mem_available_kb\":%llu,\"maps\":%lld,\"server_rss_kb\":%ld},\"clients_count\":%d}\n", avail, maps, rss, count);
++#undef APP
++    return n;
++overflow:
++    return -1;
++}
++
++static int ctl_do_set(const ctl_req *r, char *out, size_t cap, uid_t uid)
++{
++    vkb_mem_budget_cfg cfg;
++    vkb_mem_budget_get(&cfg);
++    if (r->has_total) cfg.total_mb = r->total_mb;
++    if (r->has_pid) cfg.pid_mb = r->pid_mb;
++    if (r->has_floor) cfg.floor_mb = r->floor_mb;
++    if (r->has_map) cfg.map_limit = r->map_limit;
++    if (!vkb_mem_budget_valid(&cfg)) return snprintf(out, cap, "{\"ok\":false,\"error\":\"budget values out of range\"}\n");
++    if (r->persist) {
++        char err[256], esc[768];
++        if (vkb_mem_budget_write_conf(&cfg, err, sizeof(err)) != 0) {
++            ctl_escape(esc, sizeof(esc), err);
++            return snprintf(out, cap, "{\"ok\":false,\"error\":\"persist failed: %s\"}\n", esc);
++        }
++    }
++    char warning[320] = "", esc[960];
++    if (vkb_mem_budget_set(&cfg, warning, sizeof(warning)) != 0)
++        return snprintf(out, cap, "{\"ok\":false,\"error\":\"budget rejected\"}\n");
++    VKB_INFO("control: budget set by uid %u: total %lld MB, per client %lld MB, MemAvailable floor %lld MB, map limit %lld%s",
++             (unsigned)uid, (long long)cfg.total_mb, (long long)cfg.pid_mb, (long long)cfg.floor_mb, (long long)cfg.map_limit,
++             r->persist ? ", written to budget.conf" : "");
++    if (warning[0]) {
++        ctl_escape(esc, sizeof(esc), warning);
++        return snprintf(out, cap, "{\"ok\":true,\"warning\":\"%s\"}\n", esc);
++    }
++    return snprintf(out, cap, "{\"ok\":true}\n");
++}
++
++static void ctl_handle(int fd, uid_t uid)
++{
++    char line[CTL_LINE_MAX + 2];
++    int64_t deadline = ctl_now_ms() + CTL_IDLE_MS;
++    for (;;) {
++        size_t len = 0;
++        int got = 0;
++        while (!got) {
++            int64_t left = deadline - ctl_now_ms();
++            if (left <= 0) {
++                ctl_reply_error(fd, "timeout");
++                return;
++            }
++            struct pollfd pfd = {.fd = fd, .events = POLLIN};
++            int pr = poll(&pfd, 1, (int)left);
++            if (pr < 0 && errno == EINTR) continue;
++            if (pr <= 0) {
++                ctl_reply_error(fd, "timeout");
++                return;
++            }
++            char c;
++            ssize_t k = recv(fd, &c, 1, 0);
++            if (k < 0 && errno == EINTR) continue;
++            if (k <= 0) return;
++            if (c == '\n') {
++                got = 1;
++                break;
++            }
++            if (len >= CTL_LINE_MAX) {
++                ctl_reply_error(fd, "line too long");
++                return;
++            }
++            line[len++] = c;
++        }
++        if (len && line[len - 1] == '\r') len--;
++        if (memchr(line, 0, len)) {
++            ctl_reply_error(fd, "NUL in request");
++            return;
++        }
++        ctl_req req;
++        char err[64];
++        if (ctl_parse(line, len, &req, err, sizeof(err))) {
++            ctl_reply_error(fd, err);
++            return;
++        }
++        char out[CTL_OUT_MAX];
++        int n = req.is_set ? ctl_do_set(&req, out, sizeof(out), uid) : ctl_status(out, sizeof(out));
++        if (n <= 0 || (size_t)n >= sizeof(out) || ctl_send(fd, out, (size_t)n)) return;
++        deadline = ctl_now_ms() + CTL_IDLE_MS;
++    }
++}
++
++static int ctl_peer_uid(int fd, uid_t *out)
++{
++    struct ucred cr;
++    socklen_t len = sizeof(cr);
++    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &len) != 0) return -1;
++    *out = cr.uid;
++    for (int i = 0; i < ctl_nuids; i++)
++        if (cr.uid == ctl_uids[i]) return 0;
++    VKB_WARN("control: refused uid %u pid %d (allowed: VKBRIDGE_CONTROL_UIDS)", (unsigned)cr.uid, (int)cr.pid);
++    return -1;
++}
++
++static void *ctl_thread(void *arg)
++{
++    (void)arg;
++    while (ctl_fd >= 0) {
++        struct pollfd pfd = {.fd = ctl_fd, .events = POLLIN};
++        int pr = poll(&pfd, 1, -1);
++        if (pr < 0) {
++            if (errno == EINTR) continue;
++            break;
++        }
++        if (!(pfd.revents & POLLIN)) continue;
++        int cfd = accept4(ctl_fd, NULL, NULL, SOCK_CLOEXEC);
++        if (cfd < 0) {
++            if (errno == EINTR || errno == EAGAIN) continue;
++            VKB_WARN("control: accept: %s", strerror(errno));
++            continue;
++        }
++        uid_t uid = (uid_t)-1;
++        if (ctl_peer_uid(cfd, &uid) == 0) ctl_handle(cfd, uid);
++        close(cfd);
++    }
++    return NULL;
++}
++
++static void ctl_cleanup(void)
++{
++    if (ctl_fd >= 0) close(ctl_fd);
++    ctl_fd = -1;
++    if (ctl_path[0]) unlink(ctl_path);
++}
++
++static void ctl_uids_init(void)
++{
++    const char *s = getenv("VKBRIDGE_CONTROL_UIDS");
++    if (!s || !*s) s = getenv("VKBRIDGE_CONTROL_UID");
++    if (!s || !*s) s = "1000";
++    char buf[256];
++    snprintf(buf, sizeof(buf), "%s", s);
++    char *save = NULL;
++    for (char *tok = strtok_r(buf, ", ", &save); tok && ctl_nuids < CTL_UIDS_MAX; tok = strtok_r(NULL, ", ", &save)) {
++        char *end = NULL;
++        long v = strtol(tok, &end, 10);
++        if (end != tok && !*end && v >= 0) ctl_uids[ctl_nuids++] = (uid_t)v;
++    }
++    if (!ctl_nuids) ctl_uids[ctl_nuids++] = 1000;
++}
++
++void vkb_control_start(const char *bridge_socket)
++{
++    const char *env = getenv("VKBRIDGE_CONTROL_SOCK");
++    if (env && (!strcmp(env, "off") || !strcmp(env, "0") || !strcmp(env, "none"))) {
++        VKB_INFO("control: disabled (VKBRIDGE_CONTROL_SOCK=%s)", env);
++        return;
++    }
++    if (env && *env) {
++        if (snprintf(ctl_path, sizeof(ctl_path), "%s", env) >= (int)sizeof(ctl_path)) {
++            VKB_ERR("control: socket path too long");
++            return;
++        }
++    } else {
++        const char *slash = bridge_socket ? strrchr(bridge_socket, '/') : NULL;
++        if (!slash) {
++            VKB_ERR("control: bridge socket has no directory: %s", bridge_socket ? bridge_socket : "(none)");
++            return;
++        }
++        size_t d = (size_t)(slash - bridge_socket);
++        if (d + strlen("/control.sock") + 1 > sizeof(ctl_path)) {
++            VKB_ERR("control: socket path too long");
++            return;
++        }
++        memcpy(ctl_path, bridge_socket, d);
++        ctl_path[d] = 0;
++        strcat(ctl_path, "/control.sock");
++    }
++    struct sockaddr_un a;
++    if (strlen(ctl_path) >= sizeof(a.sun_path)) {
++        VKB_ERR("control: socket path too long (%zu bytes): %s", strlen(ctl_path), ctl_path);
++        return;
++    }
++    ctl_uids_init();
++    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    if (fd < 0) {
++        VKB_ERR("control: socket: %s", strerror(errno));
++        return;
++    }
++    struct stat sb;
++    if (lstat(ctl_path, &sb) == 0) {
++        if (!S_ISSOCK(sb.st_mode)) {
++            VKB_ERR("control: %s exists and is not a socket; not replacing it", ctl_path);
++            close(fd);
++            return;
++        }
++        int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++        int live = 0;
++        if (probe >= 0) {
++            struct sockaddr_un pa;
++            memset(&pa, 0, sizeof(pa));
++            pa.sun_family = AF_UNIX;
++            strcpy(pa.sun_path, ctl_path);
++            live = connect(probe, (struct sockaddr *)&pa, sizeof(pa)) == 0;
++            close(probe);
++        }
++        if (live) {
++            VKB_ERR("control: %s is already served by another process", ctl_path);
++            close(fd);
++            return;
++        }
++        unlink(ctl_path);
++    }
++    memset(&a, 0, sizeof(a));
++    a.sun_family = AF_UNIX;
++    strcpy(a.sun_path, ctl_path);
++    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
++        VKB_ERR("control: bind %s: %s", ctl_path, strerror(errno));
++        close(fd);
++        return;
++    }
++    chmod(ctl_path, 0666);
++    if (listen(fd, 8) < 0) {
++        VKB_ERR("control: listen: %s", strerror(errno));
++        close(fd);
++        unlink(ctl_path);
++        return;
++    }
++    ctl_fd = fd;
++    pthread_t t;
++    pthread_attr_t at;
++    pthread_attr_init(&at);
++    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
++    pthread_attr_setstacksize(&at, 256 * 1024);
++    int rc = pthread_create(&t, &at, ctl_thread, NULL);
++    pthread_attr_destroy(&at);
++    if (rc != 0) {
++        VKB_ERR("control: thread: %s", strerror(rc));
++        close(fd);
++        ctl_fd = -1;
++        unlink(ctl_path);
++        return;
++    }
++    atexit(ctl_cleanup);
++    char uids[96] = "";
++    int n = 0;
++    for (int i = 0; i < ctl_nuids; i++)
++        n += snprintf(uids + n, sizeof(uids) - (size_t)n, "%s%u", i ? "," : "", (unsigned)ctl_uids[i]);
++    VKB_INFO("control: listening on %s (mode 0666, uid %s)", ctl_path, uids);
++}
+diff --git a/server/server_main.c b/server/server_main.c
+index cb88091..183cd19 100644
+--- a/server/server_main.c
++++ b/server/server_main.c
+@@ -440,6 +440,7 @@ int main(int argc, char **argv)
+     }
+     int lfd = listen_on(sock_path);
+     if (lfd < 0) return 1;
++    vkb_control_start(sock_path); /* control.sock beside it; failure is logged, the bridge goes on */
+     VKB_INFO("listening on %s", sock_path);
+     vkb_srv_serve(lfd);
+     return 0;
+diff --git a/server/server_memory.c b/server/server_memory.c
+index 5f1094e..ceb05e3 100644
+--- a/server/server_memory.c
++++ b/server/server_memory.c
+@@ -288,6 +288,9 @@ static struct {
+ } budget;
+ static pthread_once_t budget_once = PTHREAD_ONCE_INIT;
+ static int budget_denials;
++/* The four limits are changed together by the control socket and read as one snapshot by an
++ * admission: a set is all or nothing, never a mix of the old total and the new per-client value. */
++static pthread_mutex_t budget_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ static int64_t budget_env_num(const char *name, int64_t def)
+ {
+@@ -308,15 +311,106 @@ static int64_t budget_mb_bytes(int64_t mb)
+     return mb << 20;
+ }
+ 
++/* <control socket dir>/budget.conf, or VKBRIDGE_CONTROL_CONF. It sits beside the socket mbctl
++ * talks to, so a server started for a test reads only that test's file. */
++static char budget_conf_path_buf[4096];
++static pthread_once_t budget_conf_path_once = PTHREAD_ONCE_INIT;
++
++static void budget_conf_path_init(void)
++{
++    const char *p = getenv("VKBRIDGE_CONTROL_CONF");
++    if (p && *p) {
++        snprintf(budget_conf_path_buf, sizeof(budget_conf_path_buf), "%s", p);
++        return;
++    }
++    p = getenv("VKBRIDGE_CONTROL_SOCK");
++    if (p && *p && strcmp(p, "off") && strcmp(p, "0")) {
++        const char *slash = strrchr(p, '/');
++        if (!slash) {
++            snprintf(budget_conf_path_buf, sizeof(budget_conf_path_buf), "budget.conf");
++            return;
++        }
++        size_t d = (size_t)(slash - p);
++        if (d > sizeof(budget_conf_path_buf) - sizeof("/budget.conf")) d = sizeof(budget_conf_path_buf) - sizeof("/budget.conf");
++        memcpy(budget_conf_path_buf, p, d);
++        budget_conf_path_buf[d] = 0;
++        strcat(budget_conf_path_buf, "/budget.conf");
++        return;
++    }
++    snprintf(budget_conf_path_buf, sizeof(budget_conf_path_buf), "%s", "/opt/mb-sock/budget.conf");
++}
++
++const char *vkb_mem_budget_conf_path(void)
++{
++    pthread_once(&budget_conf_path_once, budget_conf_path_init);
++    return budget_conf_path_buf;
++}
++
++static char *budget_trim(char *s)
++{
++    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
++    char *e = s + strlen(s);
++    while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
++    return s;
++}
++
++/* 1: key found with a number, 0: absent or unknown, -1: a number the budget cannot use. */
++static int budget_conf_get(const char *path, const char *key, int64_t *out)
++{
++    FILE *f = fopen(path, "r");
++    if (!f) return 0;
++    char line[256];
++    int found = 0;
++    while (fgets(line, sizeof(line), f)) {
++        char *s = budget_trim(line);
++        if (!*s || *s == '#') continue;
++        char *eq = strchr(s, '=');
++        if (!eq) continue;
++        *eq = 0;
++        char *k = budget_trim(s), *v = budget_trim(eq + 1);
++        if (strcmp(k, key)) continue;
++        char *end = NULL;
++        long long n = strtoll(v, &end, 10);
++        if (end == v || *budget_trim(end) || n < 0) {
++            fclose(f);
++            return -1;
++        }
++        *out = (int64_t)n;
++        found = 1;
++    }
++    fclose(f);
++    return found;
++}
++
++/* The environment wins; a key the environment does not set comes from budget.conf. */
++static int64_t budget_setting(const char *env, const char *key, int64_t def, int *from_conf)
++{
++    const char *v = vkb_srv_env_global(env);
++    if (v && *v) return budget_env_num(env, def);
++    int64_t n = 0;
++    int r = budget_conf_get(vkb_mem_budget_conf_path(), key, &n);
++    if (r == 1) {
++        if (from_conf) *from_conf = 1;
++        return n;
++    }
++    if (r < 0) VKB_WARN("budget.conf: %s is not a number; default %lld used", key, (long long)def);
++    return def;
++}
++
+ static void budget_init(void)
+ {
+-    budget.pid_bytes = budget_mb_bytes(budget_env_num("VKBRIDGE_MEM_BUDGET_PID_MB", BUDGET_PID_DEFAULT_MB));
+-    budget.total_bytes = budget_mb_bytes(budget_env_num("VKBRIDGE_MEM_BUDGET_TOTAL_MB", BUDGET_TOTAL_DEFAULT_MB));
+-    budget.avail_floor_kb = budget_mb_bytes(budget_env_num("VKBRIDGE_MEM_MIN_AVAIL_MB", BUDGET_AVAIL_DEFAULT_MB)) >> 10;
+-    budget.map_limit = budget_env_num("VKBRIDGE_MAP_LIMIT", BUDGET_MAPS_DEFAULT);
+-    VKB_INFO("memory budget: per client %lld MB, all clients %lld MB, MemAvailable floor %lld MB, map limit %lld%s",
++    int from_conf = 0;
++    int64_t pid_mb = budget_setting("VKBRIDGE_MEM_BUDGET_PID_MB", "pid_mb", BUDGET_PID_DEFAULT_MB, &from_conf);
++    int64_t total_mb = budget_setting("VKBRIDGE_MEM_BUDGET_TOTAL_MB", "total_mb", BUDGET_TOTAL_DEFAULT_MB, &from_conf);
++    int64_t floor_mb = budget_setting("VKBRIDGE_MEM_MIN_AVAIL_MB", "floor_mb", BUDGET_AVAIL_DEFAULT_MB, &from_conf);
++    budget.pid_bytes = budget_mb_bytes(pid_mb);
++    budget.total_bytes = budget_mb_bytes(total_mb);
++    budget.avail_floor_kb = budget_mb_bytes(floor_mb) >> 10;
++    budget.map_limit = budget_setting("VKBRIDGE_MAP_LIMIT", "map_limit", BUDGET_MAPS_DEFAULT, &from_conf);
++    VKB_INFO("memory budget: per client %lld MB, all clients %lld MB, MemAvailable floor %lld MB, map limit %lld%s%s",
+              (long long)(budget.pid_bytes >> 20), (long long)(budget.total_bytes >> 20), (long long)(budget.avail_floor_kb >> 10),
+-             (long long)budget.map_limit, budget.pid_bytes || budget.total_bytes ? "" : " (off)");
++             (long long)budget.map_limit, budget.pid_bytes || budget.total_bytes ? "" : " (off)",
++             from_conf ? " (budget.conf)" : "");
+ }
+ 
+ static int64_t budget_maps_read(void)
+@@ -390,6 +484,20 @@ static int64_t budget_live_locked(void)
+     return v + st.img_bc.bytes; /* decoded BC images are the driver's own allocations */
+ }
+ 
++typedef struct {
++    int64_t pid_bytes, total_bytes, floor_kb, map_limit;
++} budget_limits;
++
++static void budget_limits_get(budget_limits *l)
++{
++    pthread_mutex_lock(&budget_cfg_lock);
++    l->pid_bytes = budget.pid_bytes;
++    l->total_bytes = budget.total_bytes;
++    l->floor_kb = budget.avail_floor_kb;
++    l->map_limit = budget.map_limit;
++    pthread_mutex_unlock(&budget_cfg_lock);
++}
++
+ static void budget_deny(const char *what, int pid, uint64_t bytes, const char *why, int64_t used_pid, int64_t used_total)
+ {
+     int n = __atomic_fetch_add(&budget_denials, 1, __ATOMIC_RELAXED);
+@@ -397,10 +505,12 @@ static void budget_deny(const char *what, int pid, uint64_t bytes, const char *w
+         if (n == 32) VKB_WARN("memory budget: further refusals are not logged");
+         return;
+     }
++    budget_limits lim;
++    budget_limits_get(&lim);
+     char usage[160] = "";
+     if (used_pid >= 0 && used_total >= 0)
+         snprintf(usage, sizeof(usage), ", this client %lld MB of %lld, all clients %lld MB of %lld", (long long)(used_pid >> 20),
+-                 (long long)(budget.pid_bytes >> 20), (long long)(used_total >> 20), (long long)(budget.total_bytes >> 20));
++                 (long long)(lim.pid_bytes >> 20), (long long)(used_total >> 20), (long long)(lim.total_bytes >> 20));
+     VKB_WARN("memory budget: %s for pid %d: %llu bytes (%llu MB) refused (%s)%s; MemAvailable %llu MB, maps %lld; "
+              "VK_ERROR_OUT_OF_DEVICE_MEMORY", what, pid, (unsigned long long)bytes, (unsigned long long)(bytes >> 20), why, usage,
+              (unsigned long long)(budget_avail() >> 10), (long long)vkb_mem_budget_maps());
+@@ -414,14 +524,16 @@ static int budget_admit(int pid, uint64_t bytes, const char *what, int reserve)
+         budget_deny(what, pid, bytes, "larger than the budget can count", -1, -1);
+         return -1;
+     }
++    budget_limits lim;
++    budget_limits_get(&lim);
+     if (bytes >= BUDGET_BIG) {
+         uint64_t avail = budget_avail();
+-        if (budget.avail_floor_kb > 0 && avail && avail < (uint64_t)budget.avail_floor_kb) {
++        if (lim.floor_kb > 0 && avail && avail < (uint64_t)lim.floor_kb) {
+             budget_deny(what, pid, bytes, "MemAvailable is under the floor", -1, -1);
+             return -1;
+         }
+         int64_t maps = vkb_mem_budget_maps();
+-        if (budget.map_limit > 0 && maps > budget.map_limit) {
++        if (lim.map_limit > 0 && maps > lim.map_limit) {
+             budget_deny(what, pid, bytes, "too many mappings", -1, -1);
+             return -1;
+         }
+@@ -431,8 +543,8 @@ static int budget_admit(int pid, uint64_t bytes, const char *what, int reserve)
+     int64_t used_total = budget_live_locked() + budget.reserved;
+     uint64_t pid_used = used_pid > 0 ? (uint64_t)used_pid : 0;
+     uint64_t total_used = used_total > 0 ? (uint64_t)used_total : 0;
+-    int pid_ok = !budget.pid_bytes || (pid_used <= (uint64_t)budget.pid_bytes && bytes <= (uint64_t)budget.pid_bytes - pid_used);
+-    int total_ok = !budget.total_bytes || (total_used <= (uint64_t)budget.total_bytes && bytes <= (uint64_t)budget.total_bytes - total_used);
++    int pid_ok = !lim.pid_bytes || (pid_used <= (uint64_t)lim.pid_bytes && bytes <= (uint64_t)lim.pid_bytes - pid_used);
++    int total_ok = !lim.total_bytes || (total_used <= (uint64_t)lim.total_bytes && bytes <= (uint64_t)lim.total_bytes - total_used);
+     int ok = pid_ok && total_ok;
+     if (ok && reserve) {
+         budget_res_add_locked(pid, (int64_t)bytes);
+@@ -463,20 +575,22 @@ void vkb_mem_budget_cancel(int pid, uint64_t bytes) { budget_res_release(pid, by
+ int vkb_mem_budget_device(int pid)
+ {
+     pthread_once(&budget_once, budget_init);
++    budget_limits lim;
++    budget_limits_get(&lim);
+     uint64_t avail = budget_avail();
+-    if (budget.avail_floor_kb > 0 && avail && avail < (uint64_t)budget.avail_floor_kb) {
++    if (lim.floor_kb > 0 && avail && avail < (uint64_t)lim.floor_kb) {
+         budget_deny("vkCreateDevice", pid, 0, "MemAvailable is under the floor", -1, -1);
+         return -1;
+     }
+     int64_t maps = vkb_mem_budget_maps();
+-    if (budget.map_limit > 0 && maps > budget.map_limit) {
++    if (lim.map_limit > 0 && maps > lim.map_limit) {
+         budget_deny("vkCreateDevice", pid, 0, "too many mappings", -1, -1);
+         return -1;
+     }
+     pthread_mutex_lock(&st.lock);
+     int64_t used_pid = budget_pid_used_locked(pid);
+     int64_t used_total = budget_live_locked() + budget.reserved;
+-    int ok = (!budget.pid_bytes || used_pid < budget.pid_bytes) && (!budget.total_bytes || used_total < budget.total_bytes);
++    int ok = (!lim.pid_bytes || used_pid < lim.pid_bytes) && (!lim.total_bytes || used_total < lim.total_bytes);
+     pthread_mutex_unlock(&st.lock);
+     if (!ok) {
+         budget_deny("vkCreateDevice", pid, 0, "already at a limit", used_pid, used_total);
+@@ -520,6 +634,157 @@ int vkb_mem_image_budget_current(const VkImageCreateInfo *ci)
+ 
+ void vkb_mem_budget_start(void) { pthread_once(&budget_once, budget_init); }
+ 
++#define BUDGET_CFG_MAX_MB (1 << 20) /* 1 TB: far above the device, low enough that << 20 cannot overflow */
++#define BUDGET_CFG_MAX_MAPS 10000000
++
++int vkb_mem_budget_valid(const vkb_mem_budget_cfg *c)
++{
++    return c && c->total_mb >= 0 && c->total_mb <= BUDGET_CFG_MAX_MB && c->pid_mb >= 0 && c->pid_mb <= BUDGET_CFG_MAX_MB &&
++           c->floor_mb >= 0 && c->floor_mb <= BUDGET_CFG_MAX_MB && c->map_limit >= 0 && c->map_limit <= BUDGET_CFG_MAX_MAPS;
++}
++
++void vkb_mem_budget_get(vkb_mem_budget_cfg *out)
++{
++    if (!out) return;
++    pthread_once(&budget_once, budget_init);
++    pthread_mutex_lock(&budget_cfg_lock);
++    out->total_mb = budget.total_bytes >> 20;
++    out->pid_mb = budget.pid_bytes >> 20;
++    out->floor_mb = budget.avail_floor_kb >> 10;
++    out->map_limit = budget.map_limit;
++    pthread_mutex_unlock(&budget_cfg_lock);
++}
++
++/* All four fields go in under one lock, so a refusal above changes nothing. The warning is a
++ * snapshot of what is already in use: lowering a limit keeps those allocations (they were made
++ * under the old one); only later ones fail with VK_ERROR_OUT_OF_DEVICE_MEMORY. */
++int vkb_mem_budget_set(const vkb_mem_budget_cfg *in, char *warning, size_t warning_len)
++{
++    if (warning && warning_len) warning[0] = 0;
++    if (!vkb_mem_budget_valid(in)) return -1;
++    pthread_once(&budget_once, budget_init);
++    pthread_mutex_lock(&budget_cfg_lock);
++    budget.pid_bytes = budget_mb_bytes(in->pid_mb);
++    budget.total_bytes = budget_mb_bytes(in->total_mb);
++    budget.avail_floor_kb = budget_mb_bytes(in->floor_mb) >> 10;
++    budget.map_limit = in->map_limit;
++    pthread_mutex_unlock(&budget_cfg_lock);
++    if (!warning || !warning_len) return 0;
++    int64_t used_total, used_pid = 0;
++    int max_pid = 0;
++    pthread_mutex_lock(&st.lock);
++    used_total = budget_live_locked() + budget.reserved;
++    for (int i = 0; i < ST_PIDS; i++)
++        if (st.pid[i].pid && st.pid[i].bytes > used_pid) used_pid = st.pid[i].bytes, max_pid = st.pid[i].pid;
++    pthread_mutex_unlock(&st.lock);
++    int n = 0;
++#define BUDGET_WARN(...)                                                                                                              \
++    do {                                                                                                                              \
++        if (n >= 0 && n < (int)warning_len) {                                                                                         \
++            int w = snprintf(warning + n, warning_len - (size_t)n, __VA_ARGS__);                                                      \
++            if (w > 0) n += w;                                                                                                        \
++        }                                                                                                                             \
++    } while (0)
++    if (in->total_mb && used_total > budget_mb_bytes(in->total_mb))
++        BUDGET_WARN("all clients use %lld MB, above the new total %lld MB", (long long)(used_total >> 20), (long long)in->total_mb);
++    if (in->pid_mb && used_pid > budget_mb_bytes(in->pid_mb))
++        BUDGET_WARN("%spid %d uses %lld MB, above the new per-client %lld MB", n ? "; " : "", max_pid, (long long)(used_pid >> 20),
++                    (long long)in->pid_mb);
++    if (n > 0) BUDGET_WARN("; existing allocations are kept, new ones fail");
++#undef BUDGET_WARN
++    return 0;
++}
++
++int vkb_mem_budget_usage(vkb_mem_budget_client *out, int max, int *count, int64_t *total_bytes)
++{
++    pthread_once(&budget_once, budget_init);
++    if (count) *count = 0;
++    if (total_bytes) *total_bytes = 0;
++    if (!out || max < 0) max = 0;
++    pthread_mutex_lock(&st.lock);
++    int64_t total = budget_live_locked() + budget.reserved;
++    int n = 0;
++    for (int i = 0; i < ST_PIDS; i++) {
++        int pid = st.pid[i].pid;
++        int64_t b = st.pid[i].bytes;
++        if (!pid || b <= 0) continue;
++        for (int j = 0; j < ST_PIDS; j++)
++            if (budget.res[j].pid == pid) b += budget.res[j].bytes;
++        int dup = 0;
++        for (int k = 0; k < n && k < max; k++)
++            if (out[k].pid == pid) {
++                out[k].bytes += b;
++                dup = 1;
++                break;
++            }
++        if (dup) continue;
++        if (n < max) out[n].pid = pid, out[n].bytes = b;
++        n++;
++    }
++    /* A reservation whose allocation has not been accounted yet has no st.pid entry. */
++    for (int i = 0; i < ST_PIDS; i++) {
++        int pid = budget.res[i].pid;
++        int64_t b = budget.res[i].bytes;
++        if (!pid || b <= 0) continue;
++        int seen = 0;
++        for (int j = 0; j < ST_PIDS && !seen; j++)
++            if (st.pid[j].pid == pid) seen = 1;
++        for (int k = 0; k < n && k < max && !seen; k++)
++            if (out[k].pid == pid) seen = 1;
++        if (seen) continue;
++        if (n < max) out[n].pid = pid, out[n].bytes = b;
++        n++;
++    }
++    pthread_mutex_unlock(&st.lock);
++    if (n > max) n = max;
++    if (count) *count = n;
++    if (total_bytes) *total_bytes = total;
++    return n;
++}
++
++int vkb_mem_budget_write_conf(const vkb_mem_budget_cfg *cfg, char *err, size_t err_len)
++{
++    if (err && err_len) err[0] = 0;
++    if (!vkb_mem_budget_valid(cfg)) {
++        if (err && err_len) snprintf(err, err_len, "invalid budget");
++        return -1;
++    }
++    const char *path = vkb_mem_budget_conf_path();
++    char tmp[4200];
++    int tn = snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
++    if (tn < 0 || (size_t)tn >= sizeof(tmp)) {
++        if (err && err_len) snprintf(err, err_len, "budget.conf path is too long");
++        return -1;
++    }
++    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
++    if (fd < 0) {
++        if (err && err_len) snprintf(err, err_len, "open %s: %s", tmp, strerror(errno));
++        return -1;
++    }
++    char buf[320];
++    int n = snprintf(buf, sizeof(buf),
++                     "# MaliBridge memory budget (mbctl set --persist; read at startup where the environment is unset)\n"
++                     "total_mb=%lld\npid_mb=%lld\nfloor_mb=%lld\nmap_limit=%lld\n",
++                     (long long)cfg->total_mb, (long long)cfg->pid_mb, (long long)cfg->floor_mb, (long long)cfg->map_limit);
++    int ok = n > 0 && (size_t)n < sizeof(buf);
++    for (int off = 0; ok && off < n;) {
++        ssize_t w = write(fd, buf + off, (size_t)(n - off));
++        if (w < 0 && errno == EINTR) continue;
++        if (w <= 0) ok = 0;
++        else off += (int)w;
++    }
++    if (ok && fsync(fd) != 0) ok = 0;
++    int saved = errno;
++    if (close(fd) != 0 && ok) ok = 0, saved = errno;
++    if (ok && rename(tmp, path) != 0) ok = 0, saved = errno;
++    if (!ok) {
++        unlink(tmp);
++        if (err && err_len) snprintf(err, err_len, "write %s: %s", path, strerror(saved));
++        return -1;
++    }
++    return 0;
++}
++
+ uint8_t vkb_memstat_dedicated(const VkMemoryAllocateInfo *ai)
+ {
+     for (const VkBaseInStructure *b = ai->pNext; b; b = b->pNext)
+diff --git a/server/vkb_server.h b/server/vkb_server.h
+index 987963e..25d7a92 100644
+--- a/server/vkb_server.h
++++ b/server/vkb_server.h
+@@ -418,6 +418,11 @@ uint32_t vkb_lat_setting(void); /* for this thread's client (presets, <cache dir
+ 
+ /* server_conn.c */
+ void vkb_srv_serve(int listen_fd);
++/* server_control.c: the budget control socket beside the bridge socket (control.sock), owned by
++ * uid 1000 by default (VKBRIDGE_CONTROL_UIDS, comma separated). bridge_socket only names the
++ * directory; VKBRIDGE_CONTROL_SOCK overrides the path, "off" disables it. Failure is logged and
++ * the bridge keeps serving. */
++void vkb_control_start(const char *bridge_socket);
+ void vkb_srv_stats_reload(void); /* VKBRIDGE_STATS read again (after vkb_srv_env_reload) */
+ vkb_srv_table *vkb_table_get(uint32_t id);
+ uint32_t vkb_table_register(vkb_srv_table *t);
+@@ -508,6 +513,24 @@ int vkb_mem_image_budget(int pid, const VkImageCreateInfo *ci);
+ int vkb_mem_image_budget_current(const VkImageCreateInfo *ci); /* the connection thread's client */
+ VkDeviceSize vkb_mem_image_estimate(const VkImageCreateInfo *ci);
+ int64_t vkb_mem_budget_maps(void);
++/* The budget as the control socket reads and changes it (server_control.c): values in MB, 0: off.
++ * set validates first and changes every field under one lock, so a refused set leaves the budget
++ * as it was; warning says how much is already in use above the new limits. Startup reads
++ * <control socket dir>/budget.conf for a field the environment does not set. */
++#define VKB_MEM_BUDGET_CLIENTS 64
++typedef struct {
++    int64_t total_mb, pid_mb, floor_mb, map_limit;
++} vkb_mem_budget_cfg;
++typedef struct {
++    int pid;
++    int64_t bytes;
++} vkb_mem_budget_client;
++void vkb_mem_budget_get(vkb_mem_budget_cfg *out);
++int vkb_mem_budget_valid(const vkb_mem_budget_cfg *cfg);
++int vkb_mem_budget_set(const vkb_mem_budget_cfg *in, char *warning, size_t warning_len);
++int vkb_mem_budget_usage(vkb_mem_budget_client *out, int max, int *count, int64_t *total_bytes);
++int vkb_mem_budget_write_conf(const vkb_mem_budget_cfg *cfg, char *err, size_t err_len);
++const char *vkb_mem_budget_conf_path(void);
+ /* Accounting, one line every ~5 s while it changes (VKBRIDGE_MEM_STATS=0: off). */
+ uint8_t vkb_memstat_dedicated(const VkMemoryAllocateInfo *ai);
+ void vkb_memstat_image(VkFormat bc, int64_t bytes, int64_t bc_src_bytes, int64_t bc_decoded_bytes); /* bc 0: not BC */
