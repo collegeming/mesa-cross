@@ -18,6 +18,12 @@ PRE = {
     "client/wsi.c": "2b8154400f27965e4865020896e54009e050b84fbeb6394c5570d8a7ba97a0ed",
     "client/wsi_wayland.c": "c1bacef9bed28e9c9cdc166c2ee5a8eaad2456e79e153ea5f23fad38bfc28a05",
 }
+# The exact post-patch candidate (LF canonical), for --verify-candidate.
+POST = {
+    "client/wsi.h": "fc09877eb41d179c00eb633d2f38a6fbaf7008c5a8199d80bc2b7aa00b15d2ba",
+    "client/wsi.c": "ce0bee15dc432bb917481023adcc6861b13350a915a8ac7aa422a8aba7d1f96a",
+    "client/wsi_wayland.c": "bc19fcd6035514d4d3a5e251f513c38b5783be0ad3ee976f55e2f542961bd241",
+}
 
 WSI_H = [
     (b"    pthread_mutex_t lock;\n"
@@ -400,20 +406,20 @@ def main():
     if git(root, "rev-parse", "HEAD") != REVISION:
         raise SystemExit("Refusing source revision other than " + REVISION)
     have = {name: (root / name).read_bytes() for name in FILES}
+    if args.verify_candidate:
+        for name, expected in POST.items():
+            if sha(have[name]) != expected:
+                raise SystemExit("Candidate content mismatch: " + name)
+        if git(root, "diff", "--name-only", "HEAD").splitlines() != sorted(FILES):
+            raise SystemExit("Unexpected tracked changes in the candidate")
+        print("Verified the exact wl_surface-gone candidate (capacity + lifecycle included)")
+        return
     for name, expected in PRE.items():
         if sha(have[name]) != expected:
             raise SystemExit("Pre-state is not the exact lifecycle candidate: " + name)
     expected = {name: replace(canonical(have[name]), FILES[name], name) for name in FILES}
     if args.check:
         print("Verified the lifecycle candidate pre-state; the wl_surface-gone patch applies on top")
-        return
-    if args.verify_candidate:
-        for name, want in expected.items():
-            if canonical(have[name]) != want:
-                raise SystemExit("Candidate content mismatch: " + name)
-        if git(root, "diff", "--name-only", "HEAD").splitlines() != sorted(FILES):
-            raise SystemExit("Unexpected tracked changes in the candidate")
-        print("Verified the exact wl_surface-gone candidate (capacity + lifecycle included)")
         return
     for name, want in expected.items():
         if canonical(have[name]) == want:
