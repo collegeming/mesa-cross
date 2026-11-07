@@ -74,11 +74,11 @@ jobs:
             sha256sum "stage/$mode/vkbridge-server" > "stage/build-info/$mode-SHA256SUMS"
           done
           cmp -s stage/baseline/vkbridge-server stage/candidate/vkbridge-server && exit 1
-          if strings stage/baseline/vkbridge-server | grep -Fq 'memory budget:'; then
+          if strings stage/baseline/vkbridge-server | grep -Fq 'memory budget: %s for pid'; then
             echo 'baseline unexpectedly contains the budget marker' >&2
             exit 1
           fi
-          strings stage/candidate/vkbridge-server | grep -F 'memory budget:' > stage/build-info/candidate-budget-marker.txt
+          strings stage/candidate/vkbridge-server | grep -F 'memory budget: %s for pid' > stage/build-info/candidate-budget-marker.txt
           strings stage/candidate/vkbridge-server | grep -F 'MemAvailable is under the floor' \
             > stage/build-info/candidate-floor-marker.txt
           bw=$(grep -c 'warning:' stage/build-info/baseline-build.log || true)
