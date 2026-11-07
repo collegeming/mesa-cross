@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 static PFN_vkGetInstanceProcAddr gipa;
+static void *vk_lib;
 
 static void *load_vulkan(void)
 {
@@ -29,7 +30,10 @@ static void *load_vulkan(void)
         void *h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
         if (h) {
             gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
-            if (gipa) return h;
+            if (gipa) {
+                vk_lib = h;
+                return h;
+            }
             dlclose(h);
         }
     }
@@ -138,8 +142,9 @@ int main(int argc, char **argv)
         if (destroy_instance) destroy_instance(inst, NULL);
         return 0;
     }
-    PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)gipa(inst, "vkGetDeviceProcAddr");
-#define LOAD_DEV(name) PFN_##name name = gdpa ? (PFN_##name)gdpa(dev, "vk" #name) : NULL
+    PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)dlsym(vk_lib, "vkGetDeviceProcAddr");
+    if (!gdpa) gdpa = (PFN_vkGetDeviceProcAddr)gipa(inst, "vkGetDeviceProcAddr");
+#define LOAD_DEV(name) PFN_##name name = gdpa ? (PFN_##name)gdpa(dev, #name) : NULL
     LOAD_DEV(vkCreateImage);
     LOAD_DEV(vkDestroyImage);
     LOAD_DEV(vkGetImageMemoryRequirements);
@@ -147,6 +152,8 @@ int main(int argc, char **argv)
     LOAD_DEV(vkFreeMemory);
     LOAD_DEV(vkBindImageMemory);
 #undef LOAD_DEV
+    printf("pid=%d gdpa=%s alloc=%s image=%s\n", (int)getpid(), gdpa ? "yes" : "no", vkAllocateMemory ? "yes" : "no",
+           vkCreateImage ? "yes" : "no");
 
     VkImage images[64];
     VkDeviceMemory mems[64];

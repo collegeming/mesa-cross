@@ -365,7 +365,7 @@ def apply_memory(data):
             b"            m = next;\n"
             b"        }\n"
             b"    }\n"
-            b"    if (n) VKB_INFO(\"device %u (pid %d): released %lld allocation(s), %lld MB of GPU memory\", dev->id,\n"
+            b"    VKB_INFO(\"device %u (pid %d): released %lld allocation(s), %lld MB of GPU memory\", dev->id,\n"
             b"                    dev->proc ? dev->proc->pid : 0, (long long)n, MB(bytes));\n"
             b"}",
         ),
