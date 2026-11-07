@@ -123,7 +123,7 @@ jobs:
           readelf -h stage/shim/libvkb_wl_gone.so | grep 'Machine:.*AArch64'
           nm -D --defined-only stage/shim/libvkb_wl_gone.so | awk '{print $2, $3}' | sort \
             > stage/build-info/shim-exports.txt
-          printf 'T wl_proxy_marshal_array_flags\n' > stage/build-info/shim-exports-expected.txt
+          printf 'T wl_proxy_marshal_flags\n' > stage/build-info/shim-exports-expected.txt
           cmp -s stage/build-info/shim-exports.txt stage/build-info/shim-exports-expected.txt
           ldd stage/shim/libvkb_wl_gone.so > stage/build-info/shim-ldd.txt
           ! grep 'not found' stage/build-info/shim-ldd.txt
