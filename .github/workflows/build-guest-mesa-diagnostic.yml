@@ -1,4 +1,4 @@
-name: MaliBridge Wayland format capacity A-B (client only)
+name: MaliBridge Wayland WSI lifecycle A-B (client only)
 on:
   workflow_dispatch:
 permissions:
@@ -35,26 +35,35 @@ jobs:
           test -f malibridge/third_party/Vulkan-Headers-1.4.341/include/vulkan/vulkan.h
           test -f malibridge/common/gen/vkb_gen_client.c
           python3 -I diagnostics/malibridge-format-capacity-patch.py --check malibridge
+          python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py --check malibridge
       - name: Build baseline and isolated candidate using upstream target
         run: |
           set -euo pipefail
           mkdir -p stage/build-info
           dpkg-query -W > stage/build-info/build-packages.txt
           git -C malibridge rev-parse HEAD > stage/build-info/source-revision.txt
-          git -C malibridge ls-tree HEAD client/wsi_wayland.c client/wsi.c CMakeLists.txt \
+          git -C malibridge ls-tree HEAD client/wsi_wayland.c client/wsi.c client/wsi.h CMakeLists.txt \
             common/gen/vkb_gen_client.c third_party/Vulkan-Headers-1.4.341 \
             > stage/build-info/source-blobs.txt
           cmake -S malibridge -B mb-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DBUILD_VARIANT=linux-aarch64
           cp mb-build/CMakeCache.txt stage/build-info/
+          gcc -O2 -o stage/build-info/wsi-smoke diagnostics/malibridge-wsi-smoke.c \
+            -I malibridge/third_party/Vulkan-Headers-1.4.341/include -ldl
           for mode in baseline candidate; do
             if [ "$mode" = candidate ]; then
+              # The device candidate first (format capacity), then the lifecycle fix on top: the
+              # A/B difference against /opt/mb-format-* is exactly the lifecycle change.
               python3 -I diagnostics/malibridge-format-capacity-patch.py malibridge \
                 | tee stage/build-info/patch-input-fingerprints.txt
               python3 -I diagnostics/malibridge-format-capacity-patch.py --verify-candidate malibridge
+              git -C malibridge diff > stage/build-info/capacity.patch
+              python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py malibridge \
+                | tee -a stage/build-info/patch-input-fingerprints.txt
+              python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py --verify-candidate malibridge
               git -C malibridge diff --check
-              git -C malibridge diff > stage/build-info/format-capacity.patch
+              git -C malibridge diff > stage/build-info/wsi-lifecycle.patch
             fi
             # Do not build default/all targets or run upstream's global install rules.
             cmake --build mb-build --target vulkan_droidbridge --parallel 4 \
@@ -75,25 +84,45 @@ jobs:
             readelf --version-info "$lib" > "stage/build-info/$mode-symbol-versions.txt"
             ldd "$lib" > "stage/build-info/$mode-ldd.txt"
             ! grep 'not found' "stage/build-info/$mode-ldd.txt"
+            grep -E 'SONAME|NEEDED' "stage/build-info/$mode-dynamic.txt" \
+              > "stage/build-info/$mode-abi.txt"
+            nm -D --defined-only "$lib" | awk '{print $2, $3}' | sort \
+              > "stage/build-info/$mode-exports.txt"
+            VKBRIDGE_SOCKET="$PWD/stage/no-socket" timeout 30 \
+              stage/build-info/wsi-smoke "$PWD/$lib" > "stage/build-info/$mode-smoke.txt" 2>&1
             sha256sum "$lib" > "stage/build-info/$mode-SHA256SUMS"
           done
           cmp -s stage/baseline/lib/libvulkan_droidbridge.so stage/candidate/lib/libvulkan_droidbridge.so && exit 1
-          strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'dma-buf modifier table full' > stage/build-info/candidate-marker.txt
-          cp diagnostics/malibridge-format-capacity-patch.py stage/build-info/
+          # The fix may add neither a warning nor an exported symbol, soname or dependency.
+          bw=$(grep -c 'warning:' stage/build-info/baseline-build.log || true)
+          cw=$(grep -c 'warning:' stage/build-info/candidate-build.log || true)
+          printf 'baseline warnings: %s, candidate warnings: %s\n' "${bw:-0}" "${cw:-0}" \
+            > stage/build-info/warnings.txt
+          [ "${cw:-0}" -le "${bw:-0}" ]
+          cmp -s stage/build-info/baseline-abi.txt stage/build-info/candidate-abi.txt
+          cmp -s stage/build-info/baseline-exports.txt stage/build-info/candidate-exports.txt
+          cmp -s stage/build-info/baseline-smoke.txt stage/build-info/candidate-smoke.txt
+          strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'vkb-wsi: ' > stage/build-info/candidate-trace-marker.txt
+          strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'the compositor refused %d of the %u dma-buf buffers' \
+            > stage/build-info/candidate-refused-marker.txt
+          strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'dma-buf modifier table full' \
+            > stage/build-info/candidate-capacity-marker.txt
+          cp diagnostics/malibridge-format-capacity-patch.py diagnostics/malibridge-wsi-lifecycle-patch.py \
+            diagnostics/malibridge-wsi-smoke.c stage/build-info/
           ! find stage -type f -name '*server*.so' | grep .
-          tar --zstd -cf malibridge-format-capacity-aarch64.tar.zst -C stage .
-          sha256sum malibridge-format-capacity-aarch64.tar.zst > SHA256SUMS
+          tar --zstd -cf malibridge-wsi-lifecycle-aarch64.tar.zst -C stage .
+          sha256sum malibridge-wsi-lifecycle-aarch64.tar.zst > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: malibridge-format-capacity-aarch64
+          name: malibridge-wsi-lifecycle-aarch64
           path: |
-            malibridge-format-capacity-aarch64.tar.zst
+            malibridge-wsi-lifecycle-aarch64.tar.zst
             SHA256SUMS
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
-          name: malibridge-format-capacity-build-logs
+          name: malibridge-wsi-lifecycle-build-logs
           path: |
             stage/build-info/
             mb-build/CMakeFiles/CMakeConfigureLog.yaml
