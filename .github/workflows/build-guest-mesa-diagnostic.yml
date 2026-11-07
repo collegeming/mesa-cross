@@ -1,4 +1,4 @@
-name: MaliBridge Wayland WSI lifecycle A-B (client only)
+name: MaliBridge wl_surface-gone shim A-B (client only)
 on:
   workflow_dispatch:
 permissions:
@@ -36,10 +36,10 @@ jobs:
           test -f malibridge/common/gen/vkb_gen_client.c
           python3 -I diagnostics/malibridge-format-capacity-patch.py --check malibridge
           python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py --check malibridge
-      - name: Build baseline and isolated candidate using upstream target
+      - name: Build the WSI lifecycle baseline, then the wl_surface-gone candidate, and the shim
         run: |
           set -euo pipefail
-          mkdir -p stage/build-info
+          mkdir -p stage/build-info stage/shim
           dpkg-query -W > stage/build-info/build-packages.txt
           git -C malibridge rev-parse HEAD > stage/build-info/source-revision.txt
           git -C malibridge ls-tree HEAD client/wsi_wayland.c client/wsi.c client/wsi.h CMakeLists.txt \
@@ -51,21 +51,28 @@ jobs:
           cp mb-build/CMakeCache.txt stage/build-info/
           gcc -O2 -o stage/build-info/wsi-smoke diagnostics/malibridge-wsi-smoke.c \
             -I malibridge/third_party/Vulkan-Headers-1.4.341/include -ldl
+          gcc -O2 -Wall -o stage/build-info/wl-gone-smoke diagnostics/malibridge-wl-gone-smoke.c \
+            -lwayland-client
+          gcc -O2 -Wall -Wextra -shared -fPIC -o stage/shim/libvkb_wl_gone.so \
+            diagnostics/malibridge-wl-gone-shim.c -ldl -lpthread
+          # baseline: the WSI lifecycle candidate the device already has (capacity + lifecycle)
+          python3 -I diagnostics/malibridge-format-capacity-patch.py malibridge \
+            | tee stage/build-info/patch-input-fingerprints.txt
+          python3 -I diagnostics/malibridge-format-capacity-patch.py --verify-candidate malibridge
+          python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py malibridge \
+            | tee -a stage/build-info/patch-input-fingerprints.txt
+          python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py --verify-candidate malibridge
+          git -C malibridge diff --check
+          git -C malibridge diff > stage/build-info/wsi-lifecycle.patch
           for mode in baseline candidate; do
             if [ "$mode" = candidate ]; then
-              # The device candidate first (format capacity), then the lifecycle fix on top: the
-              # A/B difference against /opt/mb-format-* is exactly the lifecycle change.
-              python3 -I diagnostics/malibridge-format-capacity-patch.py malibridge \
-                | tee stage/build-info/patch-input-fingerprints.txt
-              python3 -I diagnostics/malibridge-format-capacity-patch.py --verify-candidate malibridge
-              git -C malibridge diff > stage/build-info/capacity.patch
-              python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py malibridge \
+              # Exactly the wl_surface-gone change on top of the baseline above.
+              python3 -I diagnostics/malibridge-wl-gone-patch.py malibridge \
                 | tee -a stage/build-info/patch-input-fingerprints.txt
-              python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py --verify-candidate malibridge
+              python3 -I diagnostics/malibridge-wl-gone-patch.py --verify-candidate malibridge
               git -C malibridge diff --check
-              git -C malibridge diff > stage/build-info/wsi-lifecycle.patch
+              git -C malibridge diff > stage/build-info/candidate.patch
             fi
-            # Do not build default/all targets or run upstream's global install rules.
             cmake --build mb-build --target vulkan_droidbridge --parallel 4 \
               | tee "stage/build-info/$mode-build.log"
             mkdir -p "stage/$mode/lib" "stage/$mode/share/vulkan/icd.d"
@@ -95,36 +102,64 @@ jobs:
             sha256sum "$lib" > "stage/build-info/$mode-SHA256SUMS"
           done
           cmp -s stage/baseline/lib/libvulkan_droidbridge.so stage/candidate/lib/libvulkan_droidbridge.so && exit 1
-          # The fix may add neither a warning nor an exported symbol, soname or dependency.
           bw=$(grep -c 'warning:' stage/build-info/baseline-build.log || true)
           cw=$(grep -c 'warning:' stage/build-info/candidate-build.log || true)
           printf 'baseline warnings: %s, candidate warnings: %s\n' "${bw:-0}" "${cw:-0}" \
             > stage/build-info/warnings.txt
           [ "${cw:-0}" -le "${bw:-0}" ]
+          # Same ABI; the only new export is the shim's hook.
           cmp -s stage/build-info/baseline-abi.txt stage/build-info/candidate-abi.txt
-          cmp -s stage/build-info/baseline-exports.txt stage/build-info/candidate-exports.txt
+          grep -v ' vkb_wayland_surface_gone$' stage/build-info/candidate-exports.txt \
+            > stage/build-info/candidate-exports-minus-hook.txt
+          cmp -s stage/build-info/baseline-exports.txt stage/build-info/candidate-exports-minus-hook.txt
+          grep -q '^T vkb_wayland_surface_gone$' stage/build-info/candidate-exports.txt
+          ! grep -q ' vkb_wayland_surface_gone$' stage/build-info/baseline-exports.txt
           cmp -s stage/build-info/baseline-smoke.txt stage/build-info/candidate-smoke.txt
-          strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'vkb-wsi: ' > stage/build-info/candidate-trace-marker.txt
-          strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'the compositor refused %d of the %u dma-buf buffers' \
-            > stage/build-info/candidate-refused-marker.txt
-          strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'dma-buf modifier table full' \
-            > stage/build-info/candidate-capacity-marker.txt
-          cp diagnostics/malibridge-format-capacity-patch.py diagnostics/malibridge-wsi-lifecycle-patch.py \
-            diagnostics/malibridge-wsi-smoke.c stage/build-info/
+          strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'wl_surface destroyed first' \
+            > stage/build-info/candidate-gone-marker.txt
+          strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'vkb-wsi: ' \
+            > stage/build-info/candidate-trace-marker.txt
+          # The shim: aarch64, interposes only the one libwayland entry point, no missing deps.
+          readelf -h stage/shim/libvkb_wl_gone.so | grep 'Machine:.*AArch64'
+          nm -D --defined-only stage/shim/libvkb_wl_gone.so | awk '{print $2, $3}' | sort \
+            > stage/build-info/shim-exports.txt
+          printf 'T wl_proxy_marshal_array_flags\n' > stage/build-info/shim-exports-expected.txt
+          cmp -s stage/build-info/shim-exports.txt stage/build-info/shim-exports-expected.txt
+          ldd stage/shim/libvkb_wl_gone.so > stage/build-info/shim-ldd.txt
+          ! grep 'not found' stage/build-info/shim-ldd.txt
+          # Shim end to end, no compositor: the ICD opened RTLD_LOCAL must be found through
+          # /proc/self/maps, its hook called, and a registry miss must be a no-op.
+          VKBRIDGE_WSI_TRACE=1 VKBRIDGE_WLHOOK_TRACE=1 \
+            LD_PRELOAD="$PWD/stage/shim/libvkb_wl_gone.so" \
+            stage/build-info/wl-gone-smoke "$PWD/stage/candidate/lib/libvulkan_droidbridge.so" \
+            > stage/build-info/shim-smoke.out 2> stage/build-info/shim-smoke.err
+          grep -q '^wl-gone-smoke=OK$' stage/build-info/shim-smoke.out
+          grep -F 'vkb-wlhook: wl_surface destroy -> vkb_wayland_surface_gone' stage/build-info/shim-smoke.err
+          grep -F 'vkb-wsi: wl_surface destroyed first: 0 surface(s) marked' stage/build-info/shim-smoke.err
+          grep -F 'vkb-wlhook: wl_surface destroys 1, hooked 1, misses 0' stage/build-info/shim-smoke.err
+          stage/build-info/wl-gone-smoke "$PWD/stage/candidate/lib/libvulkan_droidbridge.so" \
+            > stage/build-info/shim-control.out 2> stage/build-info/shim-control.err
+          grep -q '^wl-gone-smoke=OK$' stage/build-info/shim-control.out
+          ! grep -q 'vkb-wlhook' stage/build-info/shim-control.err
+          cp -a diagnostics/malibridge-format-capacity-patch.py diagnostics/malibridge-wsi-lifecycle-patch.py \
+            diagnostics/malibridge-wl-gone-patch.py diagnostics/malibridge-wl-gone-shim.c \
+            diagnostics/malibridge-wl-gone-smoke.c diagnostics/malibridge-wsi-smoke.c stage/build-info/
+          cp diagnostics/malibridge-wl-gone-shim.c stage/shim/
+          sha256sum stage/shim/libvkb_wl_gone.so > stage/shim/SHA256SUMS
           ! find stage -type f -name '*server*.so' | grep .
-          tar --zstd -cf malibridge-wsi-lifecycle-aarch64.tar.zst -C stage .
-          sha256sum malibridge-wsi-lifecycle-aarch64.tar.zst > SHA256SUMS
+          tar --zstd -cf malibridge-wl-gone-aarch64.tar.zst -C stage .
+          sha256sum malibridge-wl-gone-aarch64.tar.zst > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: malibridge-wsi-lifecycle-aarch64
+          name: malibridge-wl-gone-aarch64
           path: |
-            malibridge-wsi-lifecycle-aarch64.tar.zst
+            malibridge-wl-gone-aarch64.tar.zst
             SHA256SUMS
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
-          name: malibridge-wsi-lifecycle-build-logs
+          name: malibridge-wl-gone-build-logs
           path: |
             stage/build-info/
             mb-build/CMakeFiles/CMakeConfigureLog.yaml
