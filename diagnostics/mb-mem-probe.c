@@ -140,19 +140,14 @@ int main(int argc, char **argv)
     }
     PFN_vkGetDeviceProcAddr gdpa = (PFN_vkGetDeviceProcAddr)gipa(inst, "vkGetDeviceProcAddr");
 #define LOAD_DEV(name) PFN_##name name = gdpa ? (PFN_##name)gdpa(dev, "vk" #name) : NULL
-    LOAD_DEV(vkCreateBuffer);
-    LOAD_DEV(vkDestroyBuffer);
-    LOAD_DEV(vkGetBufferMemoryRequirements);
     LOAD_DEV(vkCreateImage);
     LOAD_DEV(vkDestroyImage);
     LOAD_DEV(vkGetImageMemoryRequirements);
     LOAD_DEV(vkAllocateMemory);
     LOAD_DEV(vkFreeMemory);
-    LOAD_DEV(vkBindBufferMemory);
     LOAD_DEV(vkBindImageMemory);
 #undef LOAD_DEV
 
-    VkBuffer bufs[64];
     VkImage images[64];
     VkDeviceMemory mems[64];
     int nkeep = 0;
@@ -196,40 +191,26 @@ int main(int argc, char **argv)
             }
             vkDestroyImage(dev, img, NULL);
         } else {
-            VkBufferCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)alloc_mb << 20,
-                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                     VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
-            VkBuffer buf = VK_NULL_HANDLE;
-            r = vkCreateBuffer ? vkCreateBuffer(dev, &ci, NULL, &buf) : VK_ERROR_INITIALIZATION_FAILED;
-            if (r != VK_SUCCESS) {
-                printf("alloc %lu create_buffer result=%d\n", i, (int)r);
-                continue;
-            }
-            VkMemoryRequirements req;
-            vkGetBufferMemoryRequirements(dev, buf, &req);
-            uint32_t type = pick_type(&mp, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, type};
+            uint32_t type = pick_type(&mp, UINT32_MAX, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            VkDeviceSize size = (((VkDeviceSize)alloc_mb << 20) + 4095) & ~(VkDeviceSize)4095;
+            VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, size, type};
             VkDeviceMemory mem = VK_NULL_HANDLE;
             r = type != UINT32_MAX && vkAllocateMemory ? vkAllocateMemory(dev, &ai, NULL, &mem) : VK_ERROR_OUT_OF_DEVICE_MEMORY;
-            printf("alloc %lu pid=%d bytes=%llu type=%u result=%d\n", i, (int)getpid(), (unsigned long long)req.size, type, (int)r);
+            printf("alloc %lu pid=%d bytes=%llu type=%u result=%d\n", i, (int)getpid(), (unsigned long long)size, type, (int)r);
             if (r == VK_SUCCESS) {
-                vkBindBufferMemory(dev, buf, mem, 0);
                 if (keep && nkeep < 64) {
-                    bufs[nkeep] = buf;
                     mems[nkeep] = mem;
                     nkeep++;
                     continue;
                 }
                 vkFreeMemory(dev, mem, NULL);
             }
-            vkDestroyBuffer(dev, buf, NULL);
         }
     }
     if (hold) sleep(hold);
     for (int i = 0; i < nkeep; i++) {
         vkFreeMemory(dev, mems[i], NULL);
         if (width && height) vkDestroyImage(dev, images[i], NULL);
-        else vkDestroyBuffer(dev, bufs[i], NULL);
     }
     if (destroy_device) destroy_device(dev, NULL);
     if (destroy_instance) destroy_instance(inst, NULL);
