@@ -73,8 +73,8 @@ jobs:
       - name: Apply the control-channel patch and verify it exactly
         run: |
           set -euo pipefail
-          git -C malibridge apply --check diagnostics/malibridge-control.patch
-          git -C malibridge apply diagnostics/malibridge-control.patch
+          git -C malibridge apply --check "$PWD/diagnostics/malibridge-control.patch"
+          git -C malibridge apply "$PWD/diagnostics/malibridge-control.patch"
           git -C malibridge diff --check
           test "$(git -C malibridge hash-object server/server_control.c)" = c632d8b5e56539be5741a523a7cf5724e2f92adb
           test "$(git -C malibridge hash-object server/server_main.c)" = 183cd19b608d4247652de1dfdb3422a9ac97d40d
