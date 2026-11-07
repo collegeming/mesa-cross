@@ -54,7 +54,7 @@ jobs:
       # is about to return; CUnmap cleans the range a vkUnmapMemory releases. All
       # four run by default; GFXSTREAM_GUEST_INVALIDATE=0/off restores the
       # pre-patch behaviour, and GFXSTREAM_GUEST_INVALIDATE_STATS=1 adds counters.
-      - name: Apply guest readback-invalidate patch (A1+A2+CMap+CUnmap) and assert boundaries
+      - name: Apply readback-invalidate and imageview handle guard patches and assert boundaries
         shell: bash
         run: |
           set -euo pipefail
@@ -72,6 +72,12 @@ jobs:
             -I "$MESA_SRC_DIR/src/gfxstream/guest/vulkan_enc" \
             ./test-guest-cache-maintenance.cpp -o out/test-guest-cache-maintenance
           out/test-guest-cache-maintenance | tee out/unit-tests.txt
+          # G1/G2: on_vkCreateImageView rejects a VkImage that is not a live wrapper
+          # before encoding it, and GFXSTREAM_IMGID_DIAG=1 traces view/create/destroy
+          # handles. Runs on top of the readback patch: the script asserts the
+          # post-patch sha256 of ResourceTracker.cpp and adds no file.
+          python3 -I ./patch-guest-imageview-handle-guard.py "$MESA_SRC_DIR" \
+            --diff out/guest-imageview-handle-guard.patch | tee out/guard-patch-checks.txt
           git -C "$MESA_SRC_DIR" diff --check
           git -C "$MESA_SRC_DIR" diff --name-only HEAD -- | sort > out/patched-paths.txt
           printf '%s\n' \
@@ -102,7 +108,7 @@ jobs:
           cache-from: type=gha,scope=mesa-cross-env
           cache-to: type=gha,mode=max,scope=mesa-cross-env,ignore-error=true
 
-      - name: Build pinned guest with the readback-invalidate patch
+      - name: Build pinned guest with the readback-invalidate and imageview guard patches
         env:
           MESA_NO_IMAGE_BUILD: '1'
         shell: bash
@@ -129,9 +135,11 @@ jobs:
             printf 'MESA_URL=%s\nVULKAN_HEADERS=1.4.358\nRELEASE=false\n' "$MESA_URL"
             printf 'MESA_TREE=%s\n' "$(git -C "$MESA_SRC_DIR" rev-parse 'HEAD^{tree}')"
             printf 'MESA_PATCH=guest-readback-invalidate-a1-a2-cmap-cunmap-default-on-stats-v3\nMESA_WORKTREE_DIRTY=true\n'
+            printf 'MESA_PATCH_GUARD=guest-imageview-handle-guard-g1-g2-v1\n'
             printf 'GFXSTREAM_GUEST_INVALIDATE=on_by_default; =0|off disables; modes=1|on|all|a1|a2|cmap|cunmap|comma-list\n'
             printf 'GFXSTREAM_GUEST_INVALIDATE_STATS=opt_in; GUEST-CMO-STATS line at exit or SIGUSR1\n'
-            sha256sum patch-guest-readback-invalidate.py check-guest-readback-invalidate.py test-guest-cache-maintenance.cpp out/guest-readback-invalidate.patch out/patched-sources.sha256
+            printf 'GFXSTREAM_IMGID_DIAG=opt_in; IMGID view/create/destroy handle lines\n'
+            sha256sum patch-guest-readback-invalidate.py patch-guest-imageview-handle-guard.py check-guest-readback-invalidate.py test-guest-cache-maintenance.cpp out/guest-readback-invalidate.patch out/guest-imageview-handle-guard.patch out/patched-sources.sha256
             docker image inspect droidvm-mesa-cross:latest --format 'DOCKER_IMAGE_ID={{.Id}}'
             sha256sum Dockerfile.mesa-cross build.sh build-in-container.sh ci-build.sh mesa-config.sh package.sh aarch64-linux-gnu.meson aarch64-llvm-config ubuntu.sources
           } > out/provenance.txt
@@ -149,6 +157,12 @@ jobs:
             test -n "$(find "$root" -name "libvulkan_gfxstream.so" -print -quit)"
             test -n "$(find "$root" -name "libEGL_mesa.so*" -print -quit)"
             test -n "$(find "$root" -name "libgbm.so*" -print -quit)"
+            # The guard and its trace lines must be present as strings in the ICD.
+            so=$(find "$root" -name "libvulkan_gfxstream.so" -print -quit)
+            grep -a -q "non-boxed VkImage" "$so"
+            grep -a -q "IMGID view " "$so"
+            grep -a -q "IMGID create " "$so"
+            grep -a -q "IMGID destroy " "$so"
             cp /mesa/build-cross/meson-info/intro-buildoptions.json /out/meson-buildoptions.json
             cp /mesa/build-cross/meson-logs/meson-log.txt /out/meson-log.txt
           '
