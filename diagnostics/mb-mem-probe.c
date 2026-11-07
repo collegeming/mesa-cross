@@ -70,13 +70,7 @@ int main(int argc, char **argv)
         return 0;
     }
     PFN_vkCreateInstance create_instance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
-    PFN_vkEnumeratePhysicalDevices enum_pd = (PFN_vkEnumeratePhysicalDevices)gipa(NULL, "vkEnumeratePhysicalDevices");
-    PFN_vkGetPhysicalDeviceQueueFamilyProperties get_qf =
-        (PFN_vkGetPhysicalDeviceQueueFamilyProperties)gipa(NULL, "vkGetPhysicalDeviceQueueFamilyProperties");
-    PFN_vkGetPhysicalDeviceMemoryProperties get_mp =
-        (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(NULL, "vkGetPhysicalDeviceMemoryProperties");
-    PFN_vkDestroyInstance destroy_instance = (PFN_vkDestroyInstance)gipa(NULL, "vkDestroyInstance");
-    if (!create_instance || !enum_pd || !get_qf || !get_mp) {
+    if (!create_instance) {
         printf("pid=%d loader=incomplete\n", (int)getpid());
         return 0;
     }
@@ -87,6 +81,18 @@ int main(int argc, char **argv)
     VkResult r = create_instance(&ici, NULL, &inst);
     printf("pid=%d create_instance result=%d\n", (int)getpid(), (int)r);
     if (r != VK_SUCCESS || !inst) return 0;
+
+    PFN_vkEnumeratePhysicalDevices enum_pd = (PFN_vkEnumeratePhysicalDevices)gipa(inst, "vkEnumeratePhysicalDevices");
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties get_qf =
+        (PFN_vkGetPhysicalDeviceQueueFamilyProperties)gipa(inst, "vkGetPhysicalDeviceQueueFamilyProperties");
+    PFN_vkGetPhysicalDeviceMemoryProperties get_mp =
+        (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(inst, "vkGetPhysicalDeviceMemoryProperties");
+    PFN_vkDestroyInstance destroy_instance = (PFN_vkDestroyInstance)gipa(inst, "vkDestroyInstance");
+    if (!enum_pd || !get_qf || !get_mp) {
+        printf("pid=%d loader=incomplete\n", (int)getpid());
+        if (destroy_instance) destroy_instance(inst, NULL);
+        return 0;
+    }
 
     uint32_t n = 0;
     r = enum_pd(inst, &n, NULL);
