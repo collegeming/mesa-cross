@@ -1,4 +1,4 @@
-name: MaliBridge wl_surface-gone shim A-B (client only)
+name: MaliBridge wl_teardown no-detach shim A-B (client only)
 on:
   workflow_dispatch:
 permissions:
@@ -36,7 +36,7 @@ jobs:
           test -f malibridge/common/gen/vkb_gen_client.c
           python3 -I diagnostics/malibridge-format-capacity-patch.py --check malibridge
           python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py --check malibridge
-      - name: Build the WSI lifecycle baseline, then the wl_surface-gone candidate, and the shim
+      - name: Build the wl_surface-gone baseline, then the no-detach candidate, and the shim
         run: |
           set -euo pipefail
           mkdir -p stage/build-info stage/shim
@@ -55,21 +55,25 @@ jobs:
             -lwayland-client
           gcc -O2 -Wall -Wextra -shared -fPIC -o stage/shim/libvkb_wl_gone.so \
             diagnostics/malibridge-wl-gone-shim.c -ldl -lpthread
-          # baseline: the WSI lifecycle candidate the device already has (capacity + lifecycle)
+          # baseline: the wl_surface-gone candidate the device already has (capacity + lifecycle + hook)
           python3 -I diagnostics/malibridge-format-capacity-patch.py malibridge \
             | tee stage/build-info/patch-input-fingerprints.txt
           python3 -I diagnostics/malibridge-format-capacity-patch.py --verify-candidate malibridge
           python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py malibridge \
             | tee -a stage/build-info/patch-input-fingerprints.txt
           python3 -I diagnostics/malibridge-wsi-lifecycle-patch.py --verify-candidate malibridge
+          python3 -I diagnostics/malibridge-wl-gone-patch.py malibridge \
+            | tee -a stage/build-info/patch-input-fingerprints.txt
+          python3 -I diagnostics/malibridge-wl-gone-patch.py --verify-candidate malibridge
+          python3 -I diagnostics/malibridge-hook2-patch.py --check malibridge
           git -C malibridge diff --check
-          git -C malibridge diff > stage/build-info/wsi-lifecycle.patch
+          git -C malibridge diff > stage/build-info/wl-gone.patch
           for mode in baseline candidate; do
             if [ "$mode" = candidate ]; then
-              # Exactly the wl_surface-gone change on top of the baseline above.
-              python3 -I diagnostics/malibridge-wl-gone-patch.py malibridge \
+              # Exactly the no-detach change on top of the baseline above.
+              python3 -I diagnostics/malibridge-hook2-patch.py malibridge \
                 | tee -a stage/build-info/patch-input-fingerprints.txt
-              python3 -I diagnostics/malibridge-wl-gone-patch.py --verify-candidate malibridge
+              python3 -I diagnostics/malibridge-hook2-patch.py --verify-candidate malibridge
               git -C malibridge diff --check
               git -C malibridge diff > stage/build-info/candidate.patch
             fi
@@ -107,14 +111,15 @@ jobs:
           printf 'baseline warnings: %s, candidate warnings: %s\n' "${bw:-0}" "${cw:-0}" \
             > stage/build-info/warnings.txt
           [ "${cw:-0}" -le "${bw:-0}" ]
-          # Same ABI; the only new export is the shim's hook.
+          # Same ABI and exports: this change removes requests, it adds no symbol.
           cmp -s stage/build-info/baseline-abi.txt stage/build-info/candidate-abi.txt
-          grep -v ' vkb_wayland_surface_gone$' stage/build-info/candidate-exports.txt \
-            > stage/build-info/candidate-exports-minus-hook.txt
-          cmp -s stage/build-info/baseline-exports.txt stage/build-info/candidate-exports-minus-hook.txt
-          grep -q '^T vkb_wayland_surface_gone$' stage/build-info/candidate-exports.txt
-          ! grep -q ' vkb_wayland_surface_gone$' stage/build-info/baseline-exports.txt
+          cmp -s stage/build-info/baseline-exports.txt stage/build-info/candidate-exports.txt
           cmp -s stage/build-info/baseline-smoke.txt stage/build-info/candidate-smoke.txt
+          grep -q '^T vkb_wayland_surface_gone$' stage/build-info/candidate-exports.txt
+          # The baseline still traces the detach; the candidate must not queue it.
+          strings stage/baseline/lib/libvulkan_droidbridge.so | grep -F 'detach wl_surface' \
+            > stage/build-info/baseline-detach-marker.txt
+          ! strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'detach wl_surface'
           strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'wl_surface destroyed first' \
             > stage/build-info/candidate-gone-marker.txt
           strings stage/candidate/lib/libvulkan_droidbridge.so | grep -F 'vkb-wsi: ' \
@@ -142,24 +147,25 @@ jobs:
           grep -q '^wl-gone-smoke=OK$' stage/build-info/shim-control.out
           ! grep -q 'vkb-wlhook' stage/build-info/shim-control.err
           cp -a diagnostics/malibridge-format-capacity-patch.py diagnostics/malibridge-wsi-lifecycle-patch.py \
-            diagnostics/malibridge-wl-gone-patch.py diagnostics/malibridge-wl-gone-shim.c \
-            diagnostics/malibridge-wl-gone-smoke.c diagnostics/malibridge-wsi-smoke.c stage/build-info/
+            diagnostics/malibridge-wl-gone-patch.py diagnostics/malibridge-hook2-patch.py \
+            diagnostics/malibridge-wl-gone-shim.c diagnostics/malibridge-wl-gone-smoke.c \
+            diagnostics/malibridge-wsi-smoke.c stage/build-info/
           cp diagnostics/malibridge-wl-gone-shim.c stage/shim/
           sha256sum stage/shim/libvkb_wl_gone.so > stage/shim/SHA256SUMS
           ! find stage -type f -name '*server*.so' | grep .
-          tar --zstd -cf malibridge-wl-gone-aarch64.tar.zst -C stage .
-          sha256sum malibridge-wl-gone-aarch64.tar.zst > SHA256SUMS
+          tar --zstd -cf malibridge-hook2-aarch64.tar.zst -C stage .
+          sha256sum malibridge-hook2-aarch64.tar.zst > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: malibridge-wl-gone-aarch64
+          name: malibridge-hook2-aarch64
           path: |
-            malibridge-wl-gone-aarch64.tar.zst
+            malibridge-hook2-aarch64.tar.zst
             SHA256SUMS
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
+        name: malibridge-hook2-build-logs
         with:
-          name: malibridge-wl-gone-build-logs
           path: |
             stage/build-info/
             mb-build/CMakeFiles/CMakeConfigureLog.yaml
