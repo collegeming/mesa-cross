@@ -1,4 +1,4 @@
-name: Mesa Kopper Wayland retirement A-B
+name: Mesa Wayland displaytarget retirement A-B
 on:
   workflow_dispatch:
 permissions:
@@ -31,7 +31,7 @@ jobs:
           git -C mesa fetch --depth 1 origin 98f3d6229d61452cef80f8563af7c56ae599dc14
           git -C mesa checkout --detach FETCH_HEAD
           test "$(git -C mesa rev-parse HEAD)" = 98f3d6229d61452cef80f8563af7c56ae599dc14
-      - name: Configure pinned no-DRM trace build
+      - name: Configure pinned no-DRM build
         run: |
           set -eu
           meson setup mesa/build mesa --buildtype=release --prefix=/usr --libdir=lib \
@@ -39,7 +39,7 @@ jobs:
             -Dvulkan-drivers= -Dllvm=disabled -Dopengl=true -Dgles1=disabled \
             -Dgles2=enabled -Dgbm=enabled -Dglx=dri -Degl=enabled -Dglvnd=enabled \
             -Dgallium-va=disabled -Dbuild-tests=false
-      - name: Apply no-DRM selection and lifecycle diagnostics
+      - name: Apply no-DRM Wayland selection
         shell: bash
         run: |
           set -euo pipefail
@@ -56,25 +56,25 @@ jobs:
           assert text.count(old) == 1
           p.write_text(text.replace(old, new))
           PY
-          python3 diagnostics/mesa-kopper-lifecycle-patch.py mesa
           git -C mesa diff --check
-          git -C mesa diff > mesa-egl-nodrm.patch
+          git -C mesa diff > mesa-before-retire.patch
+          ninja -C mesa/build -j4
+          DESTDIR="$PWD/stage/baseline" meson install -C mesa/build
+      - name: Apply displaytarget retirement
+        run: |
+          set -eu
+          python3 diagnostics/mesa-dt-retire-patch.py mesa
+          git -C mesa diff --check
+          git -C mesa diff > mesa-dt-retire.patch
           ninja -C mesa/build -j4
           DESTDIR="$PWD/stage/candidate" meson install -C mesa/build
-          mv stage/candidate stage/baseline
-          cp mesa-egl-nodrm.patch mesa-before-retire.patch
-          python3 diagnostics/mesa-kopper-retire-patch.py mesa
-          git -C mesa diff --check
-          git -C mesa diff > mesa-kopper-retire.patch
-          ninja -C mesa/build -j4
-          DESTDIR="$PWD/stage/candidate" meson install -C mesa/build
-      - name: Verify and package baseline and retirement candidate
+      - name: Verify and package baseline and candidate
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p stage/build-info
           git -C mesa rev-parse HEAD > stage/build-info/source-revision.txt
-          cp mesa-before-retire.patch mesa-kopper-retire.patch stage/build-info/
+          cp mesa-before-retire.patch mesa-dt-retire.patch stage/build-info/
           cp mesa/build/meson-info/intro-buildoptions.json stage/build-info/
           dpkg-query -W > stage/build-info/build-packages.txt
           for mode in baseline candidate; do
@@ -88,17 +88,17 @@ jobs:
               ! grep 'not found' "stage/build-info/$mode-ldd.txt"
             fi
           done
-          tar --zstd -cf mesa-kopper-lifecycle-aarch64.tar.zst -C stage .
-          sha256sum mesa-kopper-lifecycle-aarch64.tar.zst > SHA256SUMS
+          tar --zstd -cf mesa-dt-retire-aarch64.tar.zst -C stage .
+          sha256sum mesa-dt-retire-aarch64.tar.zst > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: mesa-kopper-lifecycle-aarch64
+          name: mesa-dt-retire-aarch64
           path: |
-            mesa-kopper-lifecycle-aarch64.tar.zst
+            mesa-dt-retire-aarch64.tar.zst
             SHA256SUMS
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: mesa-build-logs
+          name: mesa-dt-retire-build-logs
           path: mesa/build/meson-logs/
