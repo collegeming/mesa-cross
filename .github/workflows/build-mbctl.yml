@@ -1,0 +1,166 @@
+name: MaliBridge budget control channel (server + mbctl)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      MB_REVISION: 47ec18eaa9d9f83c359d56ba412a17d61ba59a66
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git ca-certificates python3 curl unzip zstd \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu
+      - name: Fetch exact upstream source and the memory-budget baseline
+        run: |
+          set -euo pipefail
+          git init malibridge
+          git -C malibridge remote add origin https://github.com/ASEbrahim/MaliBridge.git
+          git -C malibridge fetch --depth 1 origin "$MB_REVISION"
+          git -C malibridge checkout --detach FETCH_HEAD
+          test "$(git -C malibridge rev-parse HEAD)" = "$MB_REVISION"
+          test "$(git -C malibridge rev-parse HEAD:third_party/Vulkan-Headers-1.4.341)" = 5cc90b8046cbfbd4638e0c2d0397938dab41a4ce
+          test -f malibridge/third_party/Vulkan-Headers-1.4.341/include/vulkan/vulkan.h
+          test -f malibridge/server/server_memory.c
+          python3 -I diagnostics/malibridge-mem-budget-patch.py --check malibridge
+          python3 -I diagnostics/malibridge-mem-budget-patch.py malibridge
+      - name: Fetch Android NDK
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 5 -o ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          mkdir ndk
+          unzip -q ndk.zip -d ndk
+          echo "NDK=$PWD/ndk/android-ndk-r27c" >> "$GITHUB_ENV"
+      - name: Build baseline (memory budget, no control socket)
+        run: |
+          set -euo pipefail
+          mkdir -p stage/build-info
+          dpkg-query -W > stage/build-info/build-packages.txt
+          git -C malibridge rev-parse HEAD > stage/build-info/source-revision.txt
+          git -C malibridge ls-tree HEAD server/server_memory.c server/server_instance.c server/server_main.c \
+            server/vkb_server.h common/gen/vkb_gen_server.c third_party/Vulkan-Headers-1.4.341 \
+            > stage/build-info/source-blobs.txt
+          python3 -I diagnostics/malibridge-mem-budget-patch.py --verify-candidate malibridge
+          cmake -S malibridge -B mb-build-baseline -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+            -DCMAKE_BUILD_TYPE=Release
+          cp "mb-build-baseline/CMakeCache.txt" "stage/build-info/baseline-CMakeCache.txt"
+          cmake --build "mb-build-baseline" --target vkbridge_server --parallel 4 \
+            | tee "stage/build-info/baseline-build.log"
+          mkdir -p stage/baseline
+          cp "mb-build-baseline/libvkbridge_server.so" "stage/baseline/vkbridge-server"
+          chmod 755 "stage/baseline/vkbridge-server"
+          readelf -h "stage/baseline/vkbridge-server" | tee "stage/build-info/baseline-elf.txt" | grep 'Machine:.*AArch64'
+          readelf -d "stage/baseline/vkbridge-server" > "stage/build-info/baseline-dynamic.txt"
+          readelf --version-info "stage/baseline/vkbridge-server" > "stage/build-info/baseline-symbol-versions.txt"
+          readelf -l "stage/baseline/vkbridge-server" > "stage/build-info/baseline-program-headers.txt"
+          sha256sum "stage/baseline/vkbridge-server" > "stage/build-info/baseline-SHA256SUMS"
+          if strings stage/baseline/vkbridge-server | grep -Fq 'control: listening on'; then
+            echo 'baseline unexpectedly contains the control marker' >&2
+            exit 1
+          fi
+      - name: Apply the control-channel patch and verify it exactly
+        run: |
+          set -euo pipefail
+          git -C malibridge apply --check diagnostics/malibridge-control.patch
+          git -C malibridge apply diagnostics/malibridge-control.patch
+          git -C malibridge diff --check
+          test "$(git -C malibridge hash-object server/server_control.c)" = c632d8b5e56539be5741a523a7cf5724e2f92adb
+          test "$(git -C malibridge hash-object server/server_main.c)" = 183cd19b608d4247652de1dfdb3422a9ac97d40d
+          test "$(git -C malibridge hash-object server/server_memory.c)" = ceb05e31afb741a775e1c6fa537987bcc278f32a
+          test "$(git -C malibridge hash-object server/vkb_server.h)" = 25d7a926f9a0234310ffea46a6cc9daff3fbcdac
+          git -C malibridge diff > stage/build-info/control.patch
+          git -C malibridge ls-files --others --exclude-standard > stage/build-info/control-new-files.txt
+          grep -qx server/server_control.c stage/build-info/control-new-files.txt
+      - name: Build candidate (memory budget + control socket)
+        run: |
+          set -euo pipefail
+          cmake -S malibridge -B mb-build-candidate -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+            -DCMAKE_BUILD_TYPE=Release
+          cp "mb-build-candidate/CMakeCache.txt" "stage/build-info/candidate-CMakeCache.txt"
+          cmake --build "mb-build-candidate" --target vkbridge_server --parallel 4 \
+            | tee "stage/build-info/candidate-build.log"
+          mkdir -p stage/candidate
+          cp "mb-build-candidate/libvkbridge_server.so" "stage/candidate/vkbridge-server"
+          chmod 755 "stage/candidate/vkbridge-server"
+          readelf -h "stage/candidate/vkbridge-server" | tee "stage/build-info/candidate-elf.txt" | grep 'Machine:.*AArch64'
+          readelf -d "stage/candidate/vkbridge-server" > "stage/build-info/candidate-dynamic.txt"
+          readelf --version-info "stage/candidate/vkbridge-server" > "stage/build-info/candidate-symbol-versions.txt"
+          readelf -l "stage/candidate/vkbridge-server" > "stage/build-info/candidate-program-headers.txt"
+          sha256sum "stage/candidate/vkbridge-server" > "stage/build-info/candidate-SHA256SUMS"
+          cmp -s stage/baseline/vkbridge-server stage/candidate/vkbridge-server && exit 1
+          strings stage/candidate/vkbridge-server | grep -F 'control: listening on %s' \
+            > stage/build-info/candidate-control-marker.txt
+          strings stage/candidate/vkbridge-server | grep -F 'control: budget set by uid' \
+            >> stage/build-info/candidate-control-marker.txt
+          strings stage/candidate/vkbridge-server | grep -F 'budget set by uid' >/dev/null
+          bw=$(grep -c 'warning:' stage/build-info/baseline-build.log || true)
+          cw=$(grep -c 'warning:' stage/build-info/candidate-build.log || true)
+          printf 'baseline warnings: %s, candidate warnings: %s\n' "${bw:-0}" "${cw:-0}" \
+            > stage/build-info/warnings.txt
+          [ "${cw:-0}" -le "${bw:-0}" ]
+      - name: Build mbctl and the controlled client probe (aarch64 glibc)
+        run: |
+          set -euo pipefail
+          mkdir -p stage/bin stage/probe
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -Werror -o stage/bin/mbctl diagnostics/mbctl.c
+          chmod 755 stage/bin/mbctl
+          readelf -h stage/bin/mbctl | tee stage/build-info/mbctl-elf.txt | grep 'Machine:.*AArch64'
+          readelf -d stage/bin/mbctl > stage/build-info/mbctl-dynamic.txt
+          sha256sum stage/bin/mbctl > stage/build-info/mbctl-SHA256SUMS
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -o stage/probe/mb-mem-probe diagnostics/mb-mem-probe.c \
+            -I malibridge/third_party/Vulkan-Headers-1.4.341/include -ldl
+          chmod 755 stage/probe/mb-mem-probe
+          readelf -h stage/probe/mb-mem-probe | tee stage/build-info/probe-elf.txt | grep 'Machine:.*AArch64'
+          readelf -d stage/probe/mb-mem-probe > stage/build-info/probe-dynamic.txt
+          sha256sum stage/probe/mb-mem-probe > stage/build-info/probe-SHA256SUMS
+          cp diagnostics/mbctl.c diagnostics/malibridge-control.patch diagnostics/malibridge-mem-budget-patch.py stage/build-info/
+      - name: Stage the independent-server helpers
+        run: |
+          set -euo pipefail
+          mkdir -p stage/server
+          cp diagnostics/start-independent.sh diagnostics/stop-independent.sh stage/server/
+          chmod 755 stage/server/*.sh
+          cat > stage/server/budget.conf.example <<'EOF'
+# Written by: mbctl set --persist
+total_mb=4096
+pid_mb=2048
+floor_mb=2048
+map_limit=60000
+EOF
+      - name: Package
+        run: |
+          set -euo pipefail
+          tar --zstd -cf malibridge-mbctl-aarch64.tar.zst -C stage .
+          sha256sum malibridge-mbctl-aarch64.tar.zst > SHA256SUMS
+          tar --zstd -tf malibridge-mbctl-aarch64.tar.zst | sort > stage/build-info/archive-contents.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: malibridge-mbctl-aarch64
+          path: |
+            malibridge-mbctl-aarch64.tar.zst
+            SHA256SUMS
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: malibridge-mbctl-build-logs
+          path: |
+            stage/build-info/
+            mb-build-baseline/CMakeFiles/CMakeConfigureLog.yaml
+            mb-build-candidate/CMakeFiles/CMakeConfigureLog.yaml
+            mb-build-baseline/CMakeCache.txt
+            mb-build-candidate/CMakeCache.txt
