@@ -42,8 +42,9 @@ static void usage(FILE *f)
             "       mbctl [--socket PATH] set --total MB [--pid MB] [--floor MB] [--map N] [--persist] [--json]\n"
             "       mbctl [--socket PATH] budget TOTAL [PID [FLOOR]] [--persist] [--json]\n"
             "\n"
-            "MB values: 4096, 4096M, 4G, 1.5G. TOTAL presets: 2/3/4/6/8G; PID: 1/2/3/4G;\n"
-            "FLOOR: 1.5/2/2.5/3G (defaults: PID 2G or TOTAL/2 below 4G, FLOOR 2G).\n"
+            "MB values: 4096, 4096M, 4G, 1.5G. budget takes GB without a suffix:\n"
+            "TOTAL presets 2/3/4/6/8, PID 1/2/3/4, FLOOR 1.5/2/2.5/3\n"
+            "(defaults: PID 2G or TOTAL/2 below 4G, FLOOR 2G).\n"
             "The socket is %s or $MBCTL_SOCKET; --socket overrides it.\n",
             SOCK_DEFAULT);
 }
@@ -75,6 +76,19 @@ static int parse_u64(const char *s, int64_t *out)
     long long v = strtoll(s, &end, 10);
     if (end == s || *end || errno || v < 0) return -1;
     *out = (int64_t)v;
+    return 0;
+}
+
+/* The budget presets are written as 2/3/4/6/8 (GB), 1/2/3/4 (GB) and 1.5/2/2.5/3 (GB);
+ * an explicit M or G suffix is honoured. */
+static int parse_gb(const char *s, int64_t *out)
+{
+    if (strpbrk(s, "GgMm")) return parse_mb(s, out);
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (end == s || *end || errno || v < 0 || v > 32) return -1;
+    *out = (int64_t)(v * 1024.0 + 0.5);
     return 0;
 }
 
@@ -314,7 +328,7 @@ int main(int argc, char **argv)
             if (!strcmp(argv[i], "--persist")) persist = 1;
             else if (!strcmp(argv[i], "--json")) as_json = 1;
             else if (nv < 3) {
-                if (parse_mb(argv[i], &vals[nv])) goto bad_value;
+                if (parse_gb(argv[i], &vals[nv])) goto bad_value;
                 nv++;
             } else {
                 usage(stderr);
